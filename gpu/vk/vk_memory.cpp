@@ -973,6 +973,11 @@ uint64_t shadow_seq = 0;   // (captures taken)
 // (256 MB: past it the pages no capture took in the last 64 go, the oldest first: those the game rewrites every frame
 // stay; if none can go, a page is read from guest memory as before)
 constexpr size_t kShadowMax = 65536;
+size_t shadow_max() {
+    if (const char* e = getenv("RX_VK_SHADOW_MAX_MB")) return (size_t)atoll(e) << 8;   // (MB to 4 KB pages)
+    if (low_mem_on(nullptr)) return 16384;   // (64 MB)
+    return kShadowMax;
+}
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> tex_spans;   // lo -> (hi, the present a texture was last uploaded from it)
 std::vector<std::pair<uint64_t, uint64_t>> tex_merged;          // (tex_spans merged; shadow_mu)
 bool tex_spans_changed = false;
@@ -1478,7 +1483,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             for (size_t i = 0; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
-                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) {
+                if (shadow_n.load(std::memory_order_relaxed) >= shadow_max()) {
                     if (swept) break;
                     swept = true;
                     for (auto it = shadow.begin(); it != shadow.end();) {
@@ -1488,7 +1493,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                         it = shadow.erase(it);
                         shadow_n--;
                     }
-                    if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) break;
+                    if (shadow_n.load(std::memory_order_relaxed) >= shadow_max()) break;
                 }
                 ShadowPage& slot = shadow[p];
                 if (!slot.b) {
