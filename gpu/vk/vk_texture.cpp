@@ -1416,15 +1416,42 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         x.usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (x.samples == VK_SAMPLE_COUNT_1_BIT) x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     } else {
-        // Raw storage views address one compressed block per texel (8 or 16 bytes: R32G32_UINT or
-        // R16G16B16A16_UINT for BC4, R32G32B32A32_UINT for BC3). EXTENDED_USAGE is what lets the image carry
-        // STORAGE when the compressed format itself cannot. RADV's image-format query still rejects that
-        // combination, so the bit is set here and the create below drops it if the image itself is refused.
+        // Raw storage views address one compressed block per texel. STORAGE on a compressed image needs
+        // EXTENDED_USAGE and the driver's yes from the image-format query. Creating a combination the query
+        // refuses is invalid usage (VUID-VkImageCreateInfo-imageCreateMaxMipLevels-02251), not an error
+        // vkCreateImage returns.
         flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         const VkFormat raw = bpb == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
-        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
-            x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+            VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+            info.format = x.format;
+            info.type = x.type;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = x.usage | VK_IMAGE_USAGE_STORAGE_BIT;
+            info.flags = flags;
+            VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+            const VkResult q = vkGetPhysicalDeviceImageFormatProperties2(dev.physical, &info, &props);
+            const bool ok = q == VK_SUCCESS && props.imageFormatProperties.maxArrayLayers >= x.layers &&
+                            props.imageFormatProperties.maxMipLevels >= x.levels;
+            if (ok) x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            static uint32_t seen[16];
+            static int nseen;
+            static std::mutex seen_mu;
+            std::lock_guard seen_lock(seen_mu);
+            bool fresh = true;
+            for (int i = 0; i < nseen; i++)
+                if (seen[i] == (uint32_t)x.format) fresh = false;
+            if (fresh && nseen < 16) {
+                seen[nseen++] = (uint32_t)x.format;
+                if (ok)
+                    logf("vk: format %d with storage (extended usage, block-texel views) accepted by the driver",
+                         (int)x.format);
+                else
+                    logf("vk: format %d with storage (extended usage, block-texel views) refused by the driver (%d)",
+                         (int)x.format, (int)q);
+            }
+        }
     }
     if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, x.cube = true;
@@ -1478,19 +1505,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
     } else if (!create_image(ci, x.image, x.allocation)) {
-        bool made = false;
-        if (x.usage & VK_IMAGE_USAGE_STORAGE_BIT && (is_bc(x.format) || is_astc(x.format))) {
-            x.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
-            ci.usage = x.usage;
-            made = create_image(ci, x.image, x.allocation);
-        }
-        if (!made) {
-            static int logged;
-            if (logged++ < 16)
-                logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
-                     x.levels, (int)x.format, d.format);
-            return nullptr;
-        }
+        static int logged;
+        if (logged++ < 16)
+            logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
+                 x.levels, (int)x.format, d.format);
+        return nullptr;
     }
     // what it costs: the level chain's texels
     uint64_t px = 0;
@@ -1898,12 +1917,7 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     }
     if (use == ViewUse::Storage) {
         f = force_format != VK_FORMAT_UNDEFINED ? force_format : storage_view_format(f);
-        // BC4 is 8 bytes a block. The game reinterprets that block as R16G16B16A16_UINT. RADV's storage
-        // feature for that format can be absent while R32G32_UINT (the same 8 bytes) has it. A view whose
-        // format cannot be storage is not created, and a null handle was written into the descriptor.
-        if (!(format_props(f).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
-            (is_bc(tex->format) || tex->bc))
-            f = tex->bpb >= 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32_UINT;
+        // The shader's declared format is the view's. Another format of the same block size reads other bits.
     }
     if (use == ViewUse::Attachment && is_astc(f)) return VK_NULL_HANDLE;
     const uint32_t vl = view_level(v);

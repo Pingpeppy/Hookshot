@@ -32,13 +32,17 @@ def main():
         raise SystemExit("hos_main.c: Deck profile is missing")
     if "RX_VK_DECK=0" not in MAIN:
         raise SystemExit("hos_main.c: RX_VK_DECK=0 must turn the profile off")
-    if "null image view faults RADV" not in DRAW or "dummies.view[(int)vt]" not in DRAW:
-        raise SystemExit("vk_draw.cpp: a view that was not made must be a dummy, not a null handle")
-    if "image view missing and the dummy view was not made" not in DRAW:
-        raise SystemExit("vk_draw.cpp: a draw with no view and no dummy must be skipped before bind")
+    if "if (!view && !dev.null_descriptor) view = dummies.view[(int)vt]" not in DRAW:
+        raise SystemExit("vk_draw.cpp: a missing view is null when nullDescriptor is on, else the dummy")
+    if "image view missing and the dummy view was not made" not in DRAW or "told++ < 32" not in DRAW:
+        raise SystemExit("vk_draw.cpp: a draw with no view and no dummy must be skipped, and that log capped")
+    if "nullDescriptor %s" not in (ROOT / "gpu/vk/vk_main.cpp").read_text(encoding="utf-8"):
+        raise SystemExit("vk_main.cpp: startup must say whether nullDescriptor is on")
     TEX = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     if "vkCreateImageView failed" not in TEX:
         raise SystemExit("vk_texture.cpp: a failed image view must log vkCreateImageView's result")
+    if "vkGetPhysicalDeviceImageFormatProperties2" not in TEX or "refused by the driver" not in TEX:
+        raise SystemExit("vk_texture.cpp: STORAGE on a compressed image must follow the format query")
     print("radv mesh optimizer, payload barrier and deck profile ok")
 
 

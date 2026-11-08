@@ -312,6 +312,7 @@ bool create_device() {
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
+    logf("vk: nullDescriptor %s", dev.null_descriptor ? "on" : "off");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
     dev.sparse_binding = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;

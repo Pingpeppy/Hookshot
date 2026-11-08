@@ -1923,8 +1923,11 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled.push_back(tex);
-                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                if (!view) descriptors_valid = false;
+                // nullDescriptor (robustness2): VK_NULL_HANDLE is legal for any type, format and access, and reads
+                // zero. The 1x1 RGBA8 dummy is only for devices without it (it mismatches integer, shadow and MS samplers).
+                if (!view) st_dummy_textures += handle != 0;
+                if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];
+                if (!view && !dev.null_descriptor) descriptors_valid = false;
                 dw.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
@@ -1959,8 +1962,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written.push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw.imgs.size(), handle, view ? tex : nullptr);
-                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                if (!view) descriptors_valid = false;
+                if (!view) st_dummy_textures += handle != 0;
+                if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];
+                if (!view && !dev.null_descriptor) descriptors_valid = false;
                 dw.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
@@ -2604,10 +2608,15 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
 #undef DYN_CHANGED
 
 void make_dummies() {
-    // A null VkImageView in a descriptor faults RADV (libvulkan_radeon dereferences it) even when
-    // nullDescriptor is on. These stand in for a view that was not created. nullDescriptor stays the
-    // path for buffers.
-    if (dummies.view[VK_IMAGE_VIEW_TYPE_2D] || !rec_cmd) return;
+    // Stand-ins for a view that was not created, on devices without robustness2 nullDescriptor. Where the
+    // device has it, the descriptor is VK_NULL_HANDLE instead (legal for every view type and format).
+    // Created once: a failed attempt is retried on a later recording. The clear is its own submit, waited
+    // for before any view is published, so two recordings cannot race on an uninitialised image.
+    static std::atomic<int> ready{0};
+    if (dev.null_descriptor || ready.load(std::memory_order_acquire)) return;
+    static std::mutex once;
+    std::lock_guard lock(once);
+    if (dev.null_descriptor || ready.load(std::memory_order_relaxed)) return;
     struct Img {
         VkImageType type;
         uint32_t layers;
@@ -2633,20 +2642,86 @@ void make_dummies() {
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!create_image(ci, im.image, im.alloc)) return;
-        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = im.image;
-        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.imageMemoryBarrierCount = 1;
-        di.pImageMemoryBarriers = &b;
-        vkCmdPipelineBarrier2(rec_cmd, &di);
+    }
+    static VkCommandPool pool = VK_NULL_HANDLE;
+    static VkFence fence = VK_NULL_HANDLE;
+    static bool submitted = false, cleared = false;
+    if (!submitted) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = dev.queue_family;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        bool began = false;
+        if (vkCreateCommandPool(dev.device, &pi, nullptr, &pool) == VK_SUCCESS) {
+            VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ai.commandPool = pool;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ai.commandBufferCount = 1;
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            began = vkAllocateCommandBuffers(dev.device, &ai, &cmd) == VK_SUCCESS &&
+                    vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS &&
+                    vkCreateFence(dev.device, &fi, nullptr, &fence) == VK_SUCCESS;
+        }
+        if (!began) {
+            if (fence) vkDestroyFence(dev.device, fence, nullptr), fence = VK_NULL_HANDLE;
+            if (pool) vkDestroyCommandPool(dev.device, pool, nullptr), pool = VK_NULL_HANDLE;
+            static int told;
+            if (told++ < 4) logf("vk: dummy images were not cleared; the next recording tries again");
+            return;
+        }
+        for (Img& im : imgs) {
+            VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = im.image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.imageMemoryBarrierCount = 1;
+            di.pImageMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(cmd, &di);
+            const VkClearColorValue zero{};
+            vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &b.subresourceRange);
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+            b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+        bool queued = vkEndCommandBuffer(cmd) == VK_SUCCESS;
+        if (queued) {
+            VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+            cb.commandBuffer = cmd;
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.commandBufferInfoCount = 1;
+            si.pCommandBufferInfos = &cb;
+            std::lock_guard qk(dev.present_mu);
+            queue_flush_locked();
+            queued = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+        }
+        if (!queued) {
+            vkDestroyFence(dev.device, fence, nullptr), fence = VK_NULL_HANDLE;
+            vkDestroyCommandPool(dev.device, pool, nullptr), pool = VK_NULL_HANDLE;
+            static int told;
+            if (told++ < 4) logf("vk: dummy images were not cleared; the next recording tries again");
+            return;
+        }
+        submitted = true;
+    }
+    if (!cleared) {
+        if (vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+            static int told;
+            if (told++ < 4) logf("vk: dummy images were not cleared; the next recording tries again");
+            return;
+        }
+        vkDestroyFence(dev.device, fence, nullptr), fence = VK_NULL_HANDLE;
+        vkDestroyCommandPool(dev.device, pool, nullptr), pool = VK_NULL_HANDLE;
+        cleared = true;
     }
     auto mk = [](VkImageViewType type, Img& im, uint32_t layers) {
+        if (dummies.view[(int)type]) return;
         VkImageViewUsageCreateInfo uci{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -2666,7 +2741,9 @@ void make_dummies() {
     mk(VK_IMAGE_VIEW_TYPE_CUBE, imgs[1], 6);
     mk(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, imgs[1], 6);
     mk(VK_IMAGE_VIEW_TYPE_3D, imgs[2], 1);
-    logf("vk: a view that cannot be made is a 1x1 dummy image. A null image view faults RADV");
+    if (!dummies.view[VK_IMAGE_VIEW_TYPE_2D]) return;
+    ready.store(1, std::memory_order_release);
+    logf("vk: a missing image view is a 1x1 dummy, cleared to zero (nullDescriptor is off)");
 }
 
 
@@ -2939,13 +3016,19 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     }
     for (auto& row : bank_cache)
         for (BankCache& c : row) c = BankCache{}, c.at = UINT64_MAX;
-    if (!zero_buffer) {
-        void* mapped = nullptr;
-        create_buffer(65536, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, zero_buffer, zero_alloc, &mapped);
-        if (mapped) std::memset(mapped, 0, 65536);
-        make_dummies();
+    {
+        // One thread creates these. make_dummies is called every recording so a failed clear is retried;
+        // once the views exist it returns immediately. nullDescriptor skips the images entirely.
+        static std::mutex once;
+        std::lock_guard lock(once);
+        if (!zero_buffer) {
+            void* mapped = nullptr;
+            create_buffer(65536, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, zero_buffer, zero_alloc, &mapped);
+            if (mapped) std::memset(mapped, 0, 65536);
+        }
     }
+    make_dummies();
 }
 
 // ---- RX_VK_PASS_TRACE=1: the passes and dispatches of the last frames in stream order, logged around a flash (the
@@ -4371,8 +4454,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
         if (!descriptors_valid) {
-            logf("vk: draw skipped: image view missing and the dummy view was not made (program %016llx)",
-                 (unsigned long long)p.key);
+            static std::atomic<int> told{0};
+            if (told++ < 32)
+                logf("vk: draw skipped: image view missing and the dummy view was not made (program %016llx)",
+                     (unsigned long long)p.key);
             SKIP_HERE();
         }
         static std::string last_logged;
@@ -5540,8 +5625,10 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     end_pass(cmd);
     build_descriptors(s, p);
     if (!descriptors_valid) {
-        logf("vk: dispatch skipped: image view missing and the dummy view was not made (program %016llx)",
-             (unsigned long long)p.key);
+        static std::atomic<int> told{0};
+        if (told++ < 32)
+            logf("vk: dispatch skipped: image view missing and the dummy view was not made (program %016llx)",
+                 (unsigned long long)p.key);
         SKIP_HERE();
     }
     dclock.t_desc = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
