@@ -307,10 +307,22 @@ bool create_device() {
     }
     mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;   // (not used)
     dev.mesh_shader = dev.mesh_shader && mesh.meshShader && mesh.taskShader;
+    // RX_VK_MESH_FALLBACK=1: the issue 640 compute path even when the device has mesh shaders (a backup when the
+    // driver's mesh compiler faults). Off unless that variable is set.
+    const bool force_mesh_fallback = [] {
+        const char* e = getenv("RX_VK_MESH_FALLBACK");
+        return e && e[0] && std::atoi(e) != 0;
+    }();
+    if (force_mesh_fallback) dev.mesh_shader = false;
     // (hookshot, issue 640) RDNA1 and older GPUs: no mesh shaders, but task and mesh programs run as compute shaders
     // that write their vertices to buffers, drawn through an ordinary graphics pipeline. It needs buffer device addresses.
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
-    if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
+    if (dev.mesh_fallback && force_mesh_fallback)
+        logf("vk: task and mesh programs run as compute shaders (RX_VK_MESH_FALLBACK=1; the device has mesh shaders)");
+    else if (dev.mesh_fallback)
+        logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
+    else if (force_mesh_fallback)
+        logf("vk: RX_VK_MESH_FALLBACK=1, but this GPU has no buffer device addresses, so mesh programs are left out");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
     logf("vk: nullDescriptor %s", dev.null_descriptor ? "on" : "off");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)

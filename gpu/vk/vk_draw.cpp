@@ -914,9 +914,12 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
+    bool mesh_stages = false;
     for (const Stage& st : p.stages) {
-        if (st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT))
-            continue;   // (hookshot: the fallback's dispatches are not graphics stages)
+        if (st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT)
+            continue;   // (the fallback's dispatches are not graphics stages; a task or mesh stage stays)
+        if (st.vk_stage == VK_SHADER_STAGE_TASK_BIT_EXT || st.vk_stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+            mesh_stages = true;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
         si.module = st.module;
@@ -1109,6 +1112,10 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
                          radv ? "RADV, asked" : "AMD", radv ? "0 turns this on" : "1 keeps the optimizer");
             }
         }
+    }
+    if (mesh_stages && part < 0) {
+        static std::atomic<int> told{0};
+        if (told++ < 1) logf("vk: mesh pipeline includes the task and mesh stages");
     }
     const VkResult r = guarded_graphics(part >= 0 ? VK_NULL_HANDLE : pcache, &ci, &pl);
     if (part >= 0) {

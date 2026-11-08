@@ -48,6 +48,10 @@ def main():
         raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
     if "hookshot_vk_pipelines.bin" not in DRAW or "PipelineCreateLock" not in DRAW:
         raise SystemExit("vk_draw.cpp: the pipeline cache is Hookshot's, and creates take the RADV lock")
+    if "st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT" not in DRAW or "mesh pipeline includes the task and mesh stages" not in DRAW:
+        raise SystemExit("vk_draw.cpp: a mesh pipeline must keep its task and mesh stages")
+    if "RX_VK_MESH_FALLBACK" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: RX_VK_MESH_FALLBACK=1 must force the compute fallback")
     print("radv mesh optimizer, payload barrier and deck profile ok")
 
 
