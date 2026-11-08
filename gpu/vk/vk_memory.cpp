@@ -513,7 +513,7 @@ uint64_t memory_guest_pages() {
     void* mapped = nullptr;
     const uint64_t bytes = ((8ull << 30 >> 12) + (4ull << 30 >> 12)) * 8;
     if (!create_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                       true, b, a, &mapped, true) || !mapped) {
+                       true, b, a, &mapped, true, MemTag::PageTable) || !mapped) {
         logf("vk: no page table of guest memory: pointers in no bound buffer read as 0");
         return 0;
     }
@@ -862,7 +862,7 @@ bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& m
     size = cap_buf_size(need);
     map = nullptr;
     return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
-                                size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
+                                size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS"), MemTag::Capture) && map;
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
@@ -2579,7 +2579,7 @@ bool mirror_make(Pool& pool) {
                      (unsigned long long)(mirror_budget() >> 20));
             return false;
         }
-        if (!create_device_buffer(n, kUsage, p->mirror, p->mirror_alloc)) {
+        if (!create_device_buffer(n, kUsage, p->mirror, p->mirror_alloc, false, MemTag::Other)) {
             p->mstate = Pool::MIRROR_REFUSED;
             return false;
         }
@@ -2785,6 +2785,24 @@ void memory_end_submission(VkCommandBuffer cmd) {
     for (Pool* p : mirror_synced) p->synced_gen = gen_now;
     mirror_synced.clear();
     mirror_upload = false;
+}
+
+void memory_host_account(uint64_t* import_bytes, uint64_t* cap_n, uint64_t* cap_b, uint64_t* spare_n, uint64_t* spare_b,
+                         uint64_t* shadow_pages) {
+    if (import_bytes) {
+        std::lock_guard lk(pools_mu);
+        uint64_t live = 0;
+        for (const auto& kv : imported) live += kv.second.hi - kv.second.lo;
+        *import_bytes = live;
+    }
+    if (cap_n) *cap_n = cap_bufs.size();
+    if (cap_b) *cap_b = cap_bytes;
+    {
+        std::lock_guard lk(cap_free_mu);
+        if (spare_n) *spare_n = cap_free.size();
+        if (spare_b) *spare_b = cap_free_bytes;
+    }
+    if (shadow_pages) *shadow_pages = shadow_n.load(std::memory_order_relaxed);
 }
 
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {

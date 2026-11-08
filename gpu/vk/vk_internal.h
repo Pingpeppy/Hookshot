@@ -180,8 +180,7 @@ uint64_t memory_capture_view();          // (bumped when a capture is published 
 uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)
 uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
-bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
-                          void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
+// create_buffer_cached is declared with the other device-memory functions (a MemTag names the allocation)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
 void invalidate_mapped(VmaAllocation allocation, uint64_t size);   // (the CPU is to read what the GPU wrote: a no-op in coherent memory)
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
@@ -220,23 +219,40 @@ VkFormatInfo vk_format(int nvn_format);
 bool is_depth_format(VkFormat f);
 bool has_stencil(VkFormat f);
 
+// What a device or host allocation is, so the Deck memory line can name the bytes that are not textures.
+// Stored on the allocation (vmaSetAllocationUserData) and counted in mem_tag_bytes.
+enum class MemTag : int {
+    Texture = 0, RenderTarget, Capture, Staging, Stream, BcScratch, PageTable, Download, Present, Debug, Other, Count
+};
+void mem_tag_move(VmaAllocation allocation, MemTag tag);
+uint64_t mem_tag_bytes(MemTag tag);
+uint64_t mem_tag_count(MemTag tag);
+void mem_tag_format(char* buf, size_t n);
+
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false);
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false,
+                  MemTag tag = MemTag::Other);
 void destroy_image(VkImage image, VmaAllocation allocation);
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);
 /// (dedicated: its own memory object, not a share of a 64 MB block: for the 16 to 32 MB ones that fit two to a block and leave
 /// the rest of it free; RX_VK_BLOCK_BUFFERS=1: as before)
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
-                   VmaAllocation& allocation, void** mapped, bool dedicated = false);
+                   VmaAllocation& allocation, void** mapped, bool dedicated = false, MemTag tag = MemTag::Other);
+bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                          void** mapped, bool dedicated = false, MemTag tag = MemTag::Other);
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation);
 /// A buffer in VRAM only (within the driver's budget), or false
-bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated = false);
+bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
+                          bool dedicated = false, MemTag tag = MemTag::Other);
 /// Device-local memory this process uses and what the driver allows it now (VK_EXT_memory_budget), summed over the
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);
 void vma_log_heaps();
+/// Device-local heaps summed, then the other heaps. Bytes. free_in is blockBytes - allocationBytes on device heaps.
+void vma_heap_account(uint64_t* dev_used, uint64_t* dev_blocks, uint64_t* dev_alloc, uint64_t* dev_free,
+                      uint64_t* sys_used, uint64_t* sys_blocks, uint64_t* sys_alloc);
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);
@@ -246,6 +262,26 @@ void precompile_run(void (*progress)(size_t done, size_t total));
 bool prepare_run(void (*progress)(size_t done, size_t total));
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
+/// Live graphics pipelines and translated programs (the Deck memory line)
+uint64_t pipeline_count();
+uint64_t program_count();
+/// Imported guest bytes, capture buffers and shadow pages (the Deck memory line)
+void memory_host_account(uint64_t* import_bytes, uint64_t* cap_n, uint64_t* cap_bytes, uint64_t* spare_n,
+                         uint64_t* spare_bytes, uint64_t* shadow_pages);
+/// Numbers the present thread already has. deck_memlog_emit reads /proc on a worker and prints the three lines.
+struct DeckMemSnap {
+    uint64_t present = 0;
+    double seconds = 0;
+    uint64_t dev_used = 0, dev_blocks = 0, dev_alloc = 0, dev_free = 0;
+    uint64_t sys_used = 0, sys_blocks = 0, sys_alloc = 0, imports = 0;
+    uint64_t tex = 0, tex_n = 0, recent8 = 0, astc = 0, bc3 = 0, rt = 0, other = 0, budget = 0;
+    uint64_t cap_n = 0, cap_b = 0, spare_n = 0, spare_b = 0, shadow = 0, staging = 0;
+    uint64_t pipelines = 0, programs = 0;
+    int pressure = 0;
+};
+void deck_memlog_emit(DeckMemSnap snap);
+bool deck_memlog_on();
+int mem_pressure_level();
 
 } // namespace mkwvk
 

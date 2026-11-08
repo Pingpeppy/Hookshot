@@ -680,6 +680,12 @@ bool still_valid(const NvnState& s, const Program& p) {
 
 std::mutex shader_mu;
 std::unordered_map<uint64_t, std::vector<std::unique_ptr<Program>>> programs;   // by the stages' code keys
+uint64_t program_count() {
+    std::lock_guard lk(shader_mu);
+    uint64_t n = 0;
+    for (const auto& kv : programs) n += kv.second.size();
+    return n;
+}
 std::unordered_map<uint64_t, std::vector<Code>> codes;                          // by program serial
 const Shader::Profile& profile() {
     static const Shader::Profile p = make_profile();

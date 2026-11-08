@@ -180,7 +180,7 @@ bool make_img(Img& i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usag
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = usage;
-    if (!create_image(ci, i.image, i.alloc)) return false;
+    if (!create_image(ci, i.image, i.alloc, false, MemTag::Present)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = i.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;

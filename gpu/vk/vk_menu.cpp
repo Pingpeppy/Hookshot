@@ -743,7 +743,7 @@ void copy_over(VkCommandBuffer cmd, VkImage dst, Bitmap& b, Upload& u, int x, in
     if (!b.w || (uint32_t)x + b.w > w || (uint32_t)y + b.h > h) return;
     const uint64_t size = (uint64_t)b.w * b.h * 4;
     if (u.size < size) {
-        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, u.buf, u.alloc, &u.map)) return;
+        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, u.buf, u.alloc, &u.map, false, MemTag::Staging)) return;
         u.size = size, u.version = 0;
     }
     if (u.version != b.version) std::memcpy(u.map, b.px.data(), size), u.version = b.version;
@@ -815,6 +815,8 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
+    logf("vk: boot: preset %d, vram_mb %d, handheld_profile %d, HOS_HANDHELD %s", opts.preset, opts.vram_mb, opts.handheld,
+         getenv("HOS_HANDHELD") ? getenv("HOS_HANDHELD") : "unset");
 }
 
 void menu_set_gpu_count(int count) {

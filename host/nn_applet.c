@@ -85,24 +85,71 @@ HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
 }
 /* HOS_HANDHELD=1: handheld (the 1080p screen: 1080p output and the game's handheld resolutions) instead of docked
    (MKW docked composes 3840 x 2160) */
+/* handheld_profile= in hookshot_options.ini. -1: the file or the key is not there. The menu writes the file beside the
+   real executable and, when the game lives in bin/ next to image.bin, also beside the folder. Both are checked: run 10
+   had the key set and still reported docked because one of those paths was the one that was not read. */
+static int ini_handheld_key(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[96];
+    int v = -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
+    fclose(f);
+    return v;
+}
+static int ini_handheld(char *found, size_t nfound) {
+    char path[MAX_PATH];
+    const char *cands[2];
+    int nc = 0;
+    DWORD n = hos_game_path_a(path, MAX_PATH);
+    char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;
+    static char folded[MAX_PATH], raw[MAX_PATH];
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        snprintf(folded, sizeof folded, "%s", path);
+        cands[nc++] = folded;
+    }
+    n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    slash = n && n < MAX_PATH ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        if (!nc || strcmp(path, cands[0]) != 0) {
+            snprintf(raw, sizeof raw, "%s", path);
+            cands[nc++] = raw;
+        }
+    }
+    for (int i = 0; i < nc; i++) {
+        const int v = ini_handheld_key(cands[i]);
+        if (v >= 0) {
+            if (found && nfound) snprintf(found, nfound, "%s", cands[i]);
+            return v;
+        }
+    }
+    if (found && nfound && nc) snprintf(found, nfound, "%s", cands[0]);
+    return -1;
+}
 static int handheld(void) {
     static int v = -1;
     if (v < 0) {
-        v = getenv("HOS_HANDHELD") && atoi(getenv("HOS_HANDHELD")) != 0;
-        if (!getenv("HOS_HANDHELD")) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
-            char path[MAX_PATH];
-            const DWORD n = hos_game_path_a(path, MAX_PATH);
-            char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/') */
-            if (slash) {
-                snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
-                FILE *f = fopen(path, "r");
-                if (f) {
-                    char line[80];
-                    while (fgets(line, sizeof line, f))
-                        if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
-                    fclose(f);
-                }
-            }
+        char ini_path[MAX_PATH] = "";
+        const int ini = ini_handheld(ini_path, sizeof ini_path);
+        const char *env = getenv("HOS_HANDHELD");
+        if (env) {
+            v = atoi(env) != 0;
+            if (ini >= 0 && ini != v)
+                hos_log("oe: operation mode %s (HOS_HANDHELD=%s disagrees with handheld_profile=%d in %s; the environment wins)",
+                        v ? "handheld" : "docked", env, ini, ini_path);
+            else if (ini >= 0)
+                hos_log("oe: operation mode %s (HOS_HANDHELD=%s, handheld_profile=%d in %s)", v ? "handheld" : "docked", env, ini, ini_path);
+            else
+                hos_log("oe: operation mode %s (HOS_HANDHELD=%s, no handheld_profile in the options file)", v ? "handheld" : "docked", env);
+        } else if (ini >= 0) {
+            v = ini;
+            hos_log("oe: operation mode %s (handheld_profile=%d in %s, HOS_HANDHELD unset)", v ? "handheld" : "docked", ini, ini_path);
+        } else {
+            v = 0;
+            hos_log("oe: operation mode docked (HOS_HANDHELD unset, no handheld_profile; looked at %s)", ini_path[0] ? ini_path : "no options path");
         }
     }
     return v;

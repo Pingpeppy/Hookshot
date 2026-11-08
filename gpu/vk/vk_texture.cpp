@@ -264,7 +264,7 @@ Staging staging(uint64_t n, uint64_t align = 256) {
     a.size = std::max(kArena, uint64_t((n + 0xFFFFF) & ~0xFFFFFull));
     void* m = nullptr;
     if (!create_buffer(a.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
-                       a.allocation, &m) || !m)
+                       a.allocation, &m, false, MemTag::Staging) || !m)
         return {};
     a.mapped = (uint8_t*)m;
     a.value = rec_value, a.used = n;
@@ -414,7 +414,7 @@ bool bc_scratch_make() {   // (bc_mu held)
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     static const bool pool = getenv("RX_VK_BC_POOL") != nullptr;
-    if (!create_image(ii, bc_scratch, bc_scratch_alloc, !pool)) return false;
+    if (!create_image(ii, bc_scratch, bc_scratch_alloc, !pool, MemTag::BcScratch)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = bc_scratch;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -422,7 +422,7 @@ bool bc_scratch_make() {   // (bc_mu held)
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, kBcLayers};
     const uint64_t out = (uint64_t)(kBcDim / 4) * (kBcDim / 4) * kBcLayers * 16;
     if (vkCreateImageView(dev.device, &vi, nullptr, &bc_scratch_view) != VK_SUCCESS ||
-        !create_device_buffer(out, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, bc_out, bc_out_alloc, !pool)) {
+        !create_device_buffer(out, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, bc_out, bc_out_alloc, !pool, MemTag::BcScratch)) {
         if (bc_scratch_view) vkDestroyImageView(dev.device, bc_scratch_view, nullptr);
         destroy_image(bc_scratch, bc_scratch_alloc);
         bc_scratch = VK_NULL_HANDLE, bc_scratch_view = VK_NULL_HANDLE;
@@ -487,7 +487,7 @@ bool bc_scratch2_make() {
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     static const bool pool = getenv("RX_VK_BC_POOL") != nullptr;
-    if (!create_image(ii, bc_scratch2, bc_scratch2_alloc, !pool)) return false;
+    if (!create_image(ii, bc_scratch2, bc_scratch2_alloc, !pool, MemTag::BcScratch)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = bc_scratch2;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -1685,7 +1685,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.imageGranularity.width, x.sparse_req.formatProperties.imageGranularity.height,
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
-    } else if (!create_image(ci, x.image, x.allocation)) {
+    } else if (!create_image(ci, x.image, x.allocation, false, depth ? MemTag::RenderTarget : MemTag::Texture)) {
         static int logged;
         if (logged++ < 16)
             logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
@@ -2392,8 +2392,8 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
     // (cached host memory, which the CPU reads: the sequential-write kind is write-combined, or VRAM behind the BAR, and every read
     // of it by the unswizzle below goes over PCIe uncached. RX_VK_FLUSH_UNCACHED=1: as before)
     static const bool uncached = getenv("RX_VK_FLUSH_UNCACHED") != nullptr;
-    if (!(uncached ? create_buffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, buf, alloc, &map)
-                   : create_buffer_cached(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, buf, alloc, &map)) || !map)
+    if (!(uncached ? create_buffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, buf, alloc, &map, false, MemTag::Download)
+                   : create_buffer_cached(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, buf, alloc, &map, false, MemTag::Download)) || !map)
         return false;
     bool ok = readback_begin();
     if (ok) {
@@ -2572,6 +2572,7 @@ void texture_written(Texture* tex) {
         if (logged++ < 20) logf("vk: sparse texture %#llx written by the GPU (#%u)", (unsigned long long)tex->gpu, tex->id);
     }
     watch_tex(tex, "written");
+    if (!tex->gpu_written && tex->allocation) mem_tag_move(tex->allocation, MemTag::RenderTarget);
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
     tex->last_written = frame_no;
     tex->gpu_written = true;
@@ -2876,6 +2877,7 @@ Texture* texture_for_present(const nvn_tex* t) {
 void texture_frame(uint64_t completed) {
     completed_value = completed;
     frame_no++;
+    uint64_t kept = 0;
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
         static const uint64_t keep = []() -> uint64_t {
@@ -2884,7 +2886,6 @@ void texture_frame(uint64_t completed) {
             uint64_t used = 0, allowed = 0;
             return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
         }();
-        uint64_t kept = 0;
         for (auto it = arenas.begin(); it != arenas.end();) {
             const bool idle = it->value <= completed && it->value != rec_value;
             // (and one nothing has staged into for 30 s: Kokiri Forest's gameplay stages next to nothing, and the 64 MB it kept are VRAM
@@ -2955,7 +2956,11 @@ void texture_frame(uint64_t completed) {
     // may have (other programs use the GPU too). The least recently used go first, down to 7/8 of it; nothing the
     // last 8 presents used, nothing recorded work may still read.
     static uint64_t own = 0;
-    if (frame_no % 10) return;
+    static auto memlog_at = std::chrono::steady_clock::time_point{};
+    const auto memlog_now = std::chrono::steady_clock::now();
+    const bool memlog_due = deck_memlog_on() && (frame_no % 600 == 0 || memlog_at.time_since_epoch().count() == 0 ||
+                                                 memlog_now - memlog_at >= std::chrono::seconds(10));
+    if (frame_no % 10 && !memlog_due) return;
     uint64_t used = 0, allowed = 0, block_free = 0;
     const bool known = vram_usage(&used, &allowed, &block_free);
     if (!own)   // (RX_VK_VRAM_MB, else 70% of what the driver allows the process at the first look)
@@ -3037,6 +3042,39 @@ void texture_frame(uint64_t completed) {
                  (unsigned long long)(big[i]->bytes >> 20), (unsigned long long)big[i]->gpu, big[i]->width, big[i]->height,
                  big[i]->depth, big[i]->layers, big[i]->levels, big[i]->nvn_format, big[i]->astc ? " ASTC" : "",
                  big[i]->gpu_written ? " rendered" : "", (unsigned long long)(frame_no - big[i]->last_frame));
+    }
+    if (memlog_due) {
+        static auto boot = std::chrono::steady_clock::now();
+        const auto now = memlog_now;
+        memlog_at = now;
+        {
+            uint64_t astc_b = 0, bc3_b = 0, rt_b = 0, other_b = 0, recent_b = 0;
+            for (auto& kv : textures) {
+                const Texture* t = kv.second.get();
+                if (t->bc) bc3_b += t->bytes;
+                (t->astc ? astc_b : t->gpu_written ? rt_b : other_b) += t->bytes;
+                if (frame_no - t->last_frame < 8) recent_b += t->bytes;
+            }
+            DeckMemSnap snap;
+            snap.present = frame_no;
+            snap.seconds = std::chrono::duration<double>(now - boot).count();
+            vma_heap_account(&snap.dev_used, &snap.dev_blocks, &snap.dev_alloc, &snap.dev_free, &snap.sys_used, &snap.sys_blocks, &snap.sys_alloc);
+            memory_host_account(&snap.imports, &snap.cap_n, &snap.cap_b, &snap.spare_n, &snap.spare_b, &snap.shadow);
+            snap.shadow <<= 12;
+            snap.tex = total_bytes;
+            snap.tex_n = textures.size();
+            snap.recent8 = recent_b;
+            snap.astc = astc_b;
+            snap.bc3 = bc3_b;
+            snap.rt = rt_b;
+            snap.other = other_b;
+            snap.budget = budget;
+            snap.staging = kept;
+            snap.pipelines = pipeline_count();
+            snap.programs = program_count();
+            snap.pressure = mem_pressure_level();
+            deck_memlog_emit(snap);
+        }
     }
     if (verify_dim().first && frame_no % 300 == 0) {
         int checked = 0, changed = 0, missed = 0;

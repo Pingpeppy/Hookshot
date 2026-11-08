@@ -183,7 +183,7 @@ VkDescriptorBufferInfo miss_binding(uint64_t prog) {
     std::lock_guard lk(miss_mu);
     if (!miss_buf) {
         void* m = nullptr;
-        if (!create_buffer((uint64_t)kMissSlice * kMissSlices, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, miss_buf, miss_mem, &m))
+        if (!create_buffer((uint64_t)kMissSlice * kMissSlices, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, miss_buf, miss_mem, &m, false, MemTag::Debug))
             return {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
         miss_map = (uint32_t*)m;
         std::memset(miss_map, 0, (size_t)kMissSlice * kMissSlices);
@@ -385,7 +385,7 @@ bool stream_next(uint64_t need) {
         RecordingRes::Stream s{};
         s.size = std::max<uint64_t>((need + (1u << 20) - 1) & ~((1ull << 20) - 1), std::min<uint64_t>(r.size * 2, 32ull << 20));
         void* mapped = nullptr;
-        if (!create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true) || !mapped) return false;
+        if (!create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true, MemTag::Stream) || !mapped) return false;
         s.mapped = (uint8_t*)mapped;
         stream_extra += s.size, stream_grown++;
         static int logged;
@@ -682,6 +682,8 @@ struct PipeEntry {
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};   // (a fast-linked one first, the worker's full build over it)
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
+std::atomic<uint64_t> pipeline_live{0};
+uint64_t pipeline_count() { return pipeline_live.load(std::memory_order_relaxed); }
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (hookshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
@@ -1026,7 +1028,9 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     auto it = pipelines.find(key);
     if (it != pipelines.end()) return remember(mine[key] = it->second.get());
     pcache_init();
-    PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
+    auto placed = pipelines.emplace(key, std::make_unique<PipeEntry>());
+    if (placed.second) pipeline_live.fetch_add(1, std::memory_order_relaxed);
+    PipeEntry* e = placed.first->second.get();
     pipeline_note(key, p, s, at, topo);
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
@@ -3087,7 +3091,7 @@ void make_dummies() {
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (!create_image(ci, im.image, im.alloc)) return;
+        if (!create_image(ci, im.image, im.alloc, false, MemTag::Debug)) return;
     }
     static VkCommandPool pool = VK_NULL_HANDLE;
     static VkFence fence = VK_NULL_HANDLE;
@@ -3440,7 +3444,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         void* mapped = nullptr;
         RecordingRes::Stream s{};
         s.size = kStream;
-        create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true);
+        create_buffer(s.size, kStreamUse, true, s.buffer, s.alloc, &mapped, true, MemTag::Stream);
         s.mapped = (uint8_t*)mapped;
         r.streams.push_back(s);
     } else {
@@ -3494,8 +3498,8 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
         std::lock_guard lock(once);
         if (!zero_buffer) {
             void* mapped = nullptr;
-            create_buffer(65536, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, zero_buffer, zero_alloc, &mapped);
+            create_buffer(65536, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, zero_buffer, zero_alloc, &mapped, false, MemTag::Debug);
             if (mapped) std::memset(mapped, 0, 65536);
         }
     }
@@ -3560,7 +3564,7 @@ void probe_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t lay
     std::unique_lock lite_lk(probe_mu, std::defer_lock);
     if (probe_lite()) lite_lk.lock();
     if (!probe_buf && !create_buffer(uint64_t{kProbeFrames} * kProbePerFrame * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
-                                     probe_buf, probe_mem, &probe_map))
+                                     probe_buf, probe_mem, &probe_map, false, MemTag::Debug))
         return;
     const uint64_t f = texture_frame_no();
     const uint32_t slot = (uint32_t)(f % kProbeFrames);
@@ -4087,14 +4091,14 @@ void stats_tick() {
         }
         if (!stats_args) {
             void* m = nullptr;
-            if (create_buffer((uint64_t)kStatsQueries * 32, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_args, stats_args_mem, &m))
+            if (create_buffer((uint64_t)kStatsQueries * 32, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_args, stats_args_mem, &m, false, MemTag::Debug))
                 stats_args_map = (uint32_t*)m;
         }
         if (stats_args_map) std::memset(stats_args_map, 0xEE, (size_t)kStatsQueries * 32);   // (0xEEEEEEEE: never copied)
         watch_arm();
         if (watch_wanted() && !stats_watch) {
             void* m = nullptr;
-            if (create_buffer((uint64_t)kStatsQueries * kWatchMax * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_watch, stats_watch_mem, &m))
+            if (create_buffer((uint64_t)kStatsQueries * kWatchMax * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_watch, stats_watch_mem, &m, false, MemTag::Debug))
                 stats_watch_map = (uint32_t*)m;
         }
         if (stats_watch_map) std::memset(stats_watch_map, 0xEE, (size_t)kStatsQueries * kWatchMax * 16);
@@ -4447,7 +4451,7 @@ void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog,
         if (r.prog == prog) return;
     if (!stats_gpu) {
         void* m = nullptr;
-        if (!create_buffer((uint64_t)kGpuDumpSlot * kGpuDumpSlots, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_gpu, stats_gpu_mem, &m))
+        if (!create_buffer((uint64_t)kGpuDumpSlot * kGpuDumpSlots, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, stats_gpu, stats_gpu_mem, &m, false, MemTag::Debug))
             return;
         stats_gpu_map = (uint8_t*)m;
     }
@@ -4542,7 +4546,7 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
         if (!mesh_ring) {
             void* unused = nullptr;
             if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, mesh_ring,
-                               mesh_ring_mem, &unused))
+                               mesh_ring_mem, &unused, false, MemTag::Stream))
                 return false;
         }
         const uint64_t bytes = ((uint64_t)n * 12 + 15) & ~15ull;
@@ -4588,7 +4592,7 @@ bool mesh_args_ready() {
         void* mapped = nullptr;
         if (!create_buffer((uint64_t)kMeshArgs * 16,
                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true,
-                           mesh_args_buffer, mesh_args_alloc, &mapped) || !mapped)
+                           mesh_args_buffer, mesh_args_alloc, &mapped, false, MemTag::Stream) || !mapped)
             return false;
         uint32_t* w = (uint32_t*)mapped;
         mesh_args_words = w;
@@ -4684,11 +4688,11 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     void* mapped = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
+    if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped, false, MemTag::Stream)) return false;
     f.records_address = fallback_buffer_address(f.records);
     if (p.fallback_task) {
         const uint64_t payload = capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4;
-        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return false;
+        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped, false, MemTag::Stream)) return false;
         f.payload_address = fallback_buffer_address(f.payload);
     }
     if (!f.records_address) return false;
@@ -5708,7 +5712,7 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
         ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
         ic.extent = {size[0], size[1], 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
         ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-        if (!create_image(ic, hist, hist_mem)) { hist = VK_NULL_HANDLE; return false; }
+        if (!create_image(ic, hist, hist_mem, false, MemTag::Present)) { hist = VK_NULL_HANDLE; return false; }
         VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vc.image = hist, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
         vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -5991,7 +5995,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                         auto e = std::make_unique<PipeEntry>();
                         e->pipeline = made;
                         e->ready.store(true, std::memory_order_release);
-                        pipelines.emplace(n.key, std::move(e));
+                        if (pipelines.emplace(n.key, std::move(e)).second)
+                            pipeline_live.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }

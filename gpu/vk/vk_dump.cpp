@@ -334,7 +334,7 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
         it.depth_bytes = tex->format == VK_FORMAT_D16_UNORM || tex->format == VK_FORMAT_D16_UNORM_S8_UINT ? 2 : 4;
         it.depth_float = tex->format == VK_FORMAT_D32_SFLOAT || tex->format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         if (!create_buffer((uint64_t)it.w * it.h * it.depth_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer,
-                           it.buffer_alloc, &it.map))
+                           it.buffer_alloc, &it.map, false, MemTag::Debug))
             return;
         full_barrier(cmd);
         const VkBufferImageCopy c{0, 0, 0, {raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level,
@@ -370,8 +370,8 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!create_image(ci, it.image, it.image_alloc)) return;
-    if (!create_buffer((uint64_t)it.w * it.h * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.buffer_alloc, &it.map)) {
+    if (!create_image(ci, it.image, it.image_alloc, false, MemTag::Debug)) return;
+    if (!create_buffer((uint64_t)it.w * it.h * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.buffer_alloc, &it.map, false, MemTag::Debug)) {
         destroy_image(it.image, it.image_alloc);
         return;
     }
@@ -411,7 +411,7 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
     BufItem it;
     it.n = n;
     it.what = what;
-    if (!create_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.alloc, &it.map) || !it.map) return;
+    if (!create_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.alloc, &it.map, false, MemTag::Debug) || !it.map) return;
     VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;

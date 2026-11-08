@@ -7,11 +7,68 @@
 #include "vk_internal.h"
 #include <vk_mem_alloc.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 namespace mkwvk {
 
 VmaAllocator vma;
+
+namespace {
+constexpr int kTags = (int)MemTag::Count;
+std::atomic<uint64_t> tag_bytes[kTags]{};
+std::atomic<uint64_t> tag_count[kTags]{};
+int tag_index(MemTag tag) {
+    const int t = (int)tag;
+    return t >= 0 && t < kTags ? t : (int)MemTag::Other;
+}
+void mem_tag_add(VmaAllocation allocation, MemTag tag) {
+    if (!allocation) return;
+    const int t = tag_index(tag);
+    vmaSetAllocationUserData(vma, allocation, (void*)(uintptr_t)(t + 1));
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    tag_bytes[t].fetch_add(info.size, std::memory_order_relaxed);
+    tag_count[t].fetch_add(1, std::memory_order_relaxed);
+}
+void mem_tag_sub(VmaAllocation allocation) {
+    if (!allocation) return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    int t = info.pUserData ? (int)(uintptr_t)info.pUserData - 1 : (int)MemTag::Other;
+    if (t < 0 || t >= kTags) t = (int)MemTag::Other;
+    tag_bytes[t].fetch_sub(info.size, std::memory_order_relaxed);
+    tag_count[t].fetch_sub(1, std::memory_order_relaxed);
+}
+} // namespace
+
+void mem_tag_move(VmaAllocation allocation, MemTag tag) {
+    if (!allocation) return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    const int next = tag_index(tag);
+    const int cur = info.pUserData ? (int)(uintptr_t)info.pUserData - 1 : (int)MemTag::Other;
+    if (cur == next) return;
+    if (cur >= 0 && cur < kTags) {
+        tag_bytes[cur].fetch_sub(info.size, std::memory_order_relaxed);
+        tag_count[cur].fetch_sub(1, std::memory_order_relaxed);
+    }
+    vmaSetAllocationUserData(vma, allocation, (void*)(uintptr_t)(next + 1));
+    tag_bytes[next].fetch_add(info.size, std::memory_order_relaxed);
+    tag_count[next].fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t mem_tag_bytes(MemTag tag) { return tag_bytes[tag_index(tag)].load(std::memory_order_relaxed); }
+uint64_t mem_tag_count(MemTag tag) { return tag_count[tag_index(tag)].load(std::memory_order_relaxed); }
+void mem_tag_format(char* buf, size_t n) {
+    static const char* name[kTags] = {"textures", "targets", "captures", "staging", "streams", "bc scratch",
+                                      "page table", "download", "present", "debug", "other"};
+    int used = snprintf(buf, n, "vk: allocations by kind:");
+    for (int i = 0; i < kTags && used > 0 && (size_t)used < n; i++)
+        used += snprintf(buf + used, n - (size_t)used, " %s %llu MB (%llu)", name[i],
+                         (unsigned long long)(tag_bytes[i].load(std::memory_order_relaxed) >> 20),
+                         (unsigned long long)tag_count[i].load(std::memory_order_relaxed));
+}
 
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
@@ -63,7 +120,7 @@ VmaPool images_pool() {
     return image_pool;
 }
 
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated) {
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, MemTag tag) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
@@ -73,27 +130,29 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
         VmaAllocationCreateInfo dai = ai;
         dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return mem_tag_add(allocation, tag), true;
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
-        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return mem_tag_add(allocation, tag), true;
     }
-    if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return mem_tag_add(allocation, tag), true;
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
     VmaAllocationCreateInfo sai{};
     sai.usage = VMA_MEMORY_USAGE_AUTO;
     if (vmaCreateImage(vma, &ci, &sai, &image, &allocation, nullptr) != VK_SUCCESS) return false;
+    mem_tag_add(allocation, tag);
     static std::atomic<int> told{0};
     if (told++ < 4) logf("vk: VRAM full: a %ux%u image (format %d) in system memory", ci.extent.width, ci.extent.height, (int)ci.format);
     return true;
 }
 void destroy_image(VkImage image, VmaAllocation allocation) {
+    mem_tag_sub(allocation);
     vmaDestroyImage(vma, image, allocation);
 }
 uint64_t allocation_size(VmaAllocation allocation) {
@@ -102,7 +161,7 @@ uint64_t allocation_size(VmaAllocation allocation) {
     return info.size;
 }
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
-                   VmaAllocation& allocation, void** mapped, bool dedicated) {
+                   VmaAllocation& allocation, void** mapped, bool dedicated, MemTag tag) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -114,12 +173,13 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
+    mem_tag_add(allocation, tag);
     return true;
 }
 /// A buffer in cached host memory, mapped: written on one thread, read back on the CPU too (the captures: the game's
 /// threads copy pages into it, the replay reads texture pages out of it and the GPU copies the rest from it)
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
-                          void** mapped, bool dedicated) {
+                          void** mapped, bool dedicated, MemTag tag) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -130,6 +190,7 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
+    mem_tag_add(allocation, tag);
     return true;
 }
 void flush_mapped(VmaAllocation allocation, uint64_t size) {
@@ -139,9 +200,11 @@ void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
 }
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
+    mem_tag_sub(allocation);
     vmaDestroyBuffer(vma, buffer, allocation);
 }
-bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated) {
+bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated,
+                          MemTag tag) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -150,7 +213,9 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
     if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    return vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) == VK_SUCCESS;
+    if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) != VK_SUCCESS) return false;
+    mem_tag_add(allocation, tag);
+    return true;
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
 void vma_log_heaps() {
@@ -179,6 +244,27 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;
+}
+
+void vma_heap_account(uint64_t* dev_used, uint64_t* dev_blocks, uint64_t* dev_alloc, uint64_t* dev_free,
+                      uint64_t* sys_used, uint64_t* sys_blocks, uint64_t* sys_alloc) {
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    uint64_t du = 0, db = 0, da = 0, su = 0, sb = 0, sa = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++) {
+        const auto& s = b[h].statistics;
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            du += b[h].usage, db += s.blockBytes, da += s.allocationBytes;
+        else
+            su += b[h].usage, sb += s.blockBytes, sa += s.allocationBytes;
+    }
+    if (dev_used) *dev_used = du;
+    if (dev_blocks) *dev_blocks = db;
+    if (dev_alloc) *dev_alloc = da;
+    if (dev_free) *dev_free = db - std::min(db, da);
+    if (sys_used) *sys_used = su;
+    if (sys_blocks) *sys_blocks = sb;
+    if (sys_alloc) *sys_alloc = sa;
 }
 
 /// The system-memory heaps the GPU reaches: what the process uses there (the imported guest memory too: pinned by the

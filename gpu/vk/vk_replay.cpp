@@ -2254,12 +2254,12 @@ bool offscreen_init() {
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!create_image(ci, off_image, off_alloc)) return false;
+    if (!create_image(ci, off_image, off_alloc, false, MemTag::Present)) return false;
     ci.extent = {kShotW, kShotH, 1};
-    if (!create_image(ci, shot_image, shot_image_alloc)) return false;
+    if (!create_image(ci, shot_image, shot_image_alloc, false, MemTag::Present)) return false;
     for (int i = 0; i < 2; i++)
         if (!create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, shot_bufs[i],
-                           shot_allocs[i], &shot_maps[i]))
+                           shot_allocs[i], &shot_maps[i], false, MemTag::Present))
             return false;
     return true;
 }
@@ -2593,9 +2593,9 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                     ci.mipLevels = ci.arrayLayers = 1;
                     ci.samples = VK_SAMPLE_COUNT_1_BIT;
                     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-                    create_image(ci, made_image, made_alloc);
+                    create_image(ci, made_image, made_alloc, false, MemTag::Debug);
                     create_buffer((uint64_t)kShotW * kShotH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, made_buf,
-                                  made_buf_alloc, &made_map);
+                                  made_buf_alloc, &made_map, false, MemTag::Debug);
                 }
                 image_barrier(r.cmd, made_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 blit_crop(r.cmd, made_src, mw, mh, nullptr, made_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kShotW, kShotH);
@@ -2878,9 +2878,9 @@ bool framelog_ready() {
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!create_image(ci, log_image, log_image_alloc)) return false;
+    if (!create_image(ci, log_image, log_image_alloc, false, MemTag::Debug)) return false;
     for (LogSlot& l : log_slots)
-        if (!create_buffer_cached((uint64_t)kLogW * kLogH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, l.buf, l.alloc, &l.map)) return false;
+        if (!create_buffer_cached((uint64_t)kLogW * kLogH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, l.buf, l.alloc, &l.map, false, MemTag::Debug)) return false;
     std::thread([] {
         SetThreadDescription(GetCurrentThread(), L"mkw_vk frame log");
         FILE* f = fopen(framelog_path(), "wb");
