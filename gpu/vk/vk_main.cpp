@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -540,6 +541,32 @@ bool radv_mesh_payload_barrier() {
     if (e && e[0]) return std::atoi(e) != 0;
     return radv_driver();
 }
+
+bool low_mem_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_LOW_MEM");
+        if (e && e[0]) return std::atoi(e) != 0 ? 1 : 0;
+        if (const char* d = getenv("RX_VK_DECK"); d && d[0] != '0') return 1;
+#ifndef _WIN32
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char line[128];
+            unsigned long long kb = 0;
+            while (fgets(line, sizeof line, f))
+                if (sscanf(line, "MemTotal: %llu", &kb) == 1) break;
+            fclose(f);
+            if (kb && kb < 13ull * 1024 * 1024) return 1;   // (under ~13 GiB visible: Deck OLED is ~11.7)
+        }
+#endif
+        return 0;
+    }();
+    return mode != 0;
+}
+
+bool low_mem_on(const char* off_switch) {
+    if (!low_mem_mode()) return false;
+    const char* e = off_switch ? getenv(off_switch) : nullptr;
+    return !(e && e[0] == '0');
+}
 } // namespace mkwvk
 
 extern "C"
@@ -557,6 +584,10 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    std::set_new_handler([] {
+        logf("vk: C++ allocation failed. This is an out-of-memory failure, not \"window closed\" and not a GPU reset.");
+        std::abort();
+    });
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
@@ -576,6 +607,11 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
                  "RX_VK_DECK=0 leaves the Insert menu as it is. Occlusion queries: HOOKSHOT_OCCLUSION_OFF=1");
         }
     }
+    if (low_mem_mode())
+        logf("vk: low-memory mode (Deck or under ~13 GiB). Texture budget, captures, program-cache residency, staging "
+             "and import chunks are tightened. Turn one off with RX_VK_LOW_TEX=0, RX_VK_LOW_CAPTURES=0, "
+             "RX_VK_LOW_PROGRAMS=0, RX_VK_LOW_STAGING=0, RX_VK_LOW_PIPELINES=0, RX_VK_LOW_IMPORT=0, RX_VK_LOW_MIRROR=0. "
+             "RX_VK_LOW_MEM=0 turns them all off.");
     if (!dev.mesh_shader && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
         // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on)

@@ -29,6 +29,10 @@ void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
 bool radv_driver();          // (Mesa RADV; false until the device exists)
+/// Deck profile, or under about 13 GiB of RAM, unless RX_VK_LOW_MEM=0. RX_VK_LOW_MEM=1 forces it.
+bool low_mem_mode();
+/// That mode, and the feature's own switch is not 0 (RX_VK_LOW_TEX, RX_VK_LOW_CAPTURES, ...).
+bool low_mem_on(const char* off_switch);
 /// Output-memory semantics on task payload barriers. On for RADV unless RX_VK_MESH_PAYLOAD_BARRIER=0.
 bool radv_mesh_payload_barrier();
 void pace_fps_cap();         // (RX_VK_FPS_CAP: do not present faster than this)

@@ -10,6 +10,12 @@
 // (per stage: uniform buffers, storage buffers, texture buffers, image buffers, textures, images), which
 // vk_pipeline.cpp lays out from the stages' Info the same way.
 #include <io.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -786,6 +792,10 @@ struct DiskRecord { int64_t at; size_t size; uint32_t kind; };
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
+// Low memory maps the file and drops each payload's pages after the index (and after a load). The index is the
+// only thing kept. A 5.8 GB hookshot_programs.bin was otherwise read ahead into the page cache on an 11.7 GB APU.
+uint8_t* disk_map = nullptr;
+size_t disk_map_size = 0;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 FILE* disk_out = nullptr;
 bool disk_listing = false;
@@ -832,6 +842,60 @@ void disk_init() {
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
         const uint64_t stamp = disk_stamp();
         int64_t good = 0, whole = 0;
+#ifndef _WIN32
+        if (low_mem_on("RX_VK_LOW_PROGRAMS")) {
+            const int fd = open(path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st{};
+                if (fstat(fd, &st) == 0 && st.st_size >= 16) {
+                    void* mapped = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                    if (mapped != MAP_FAILED) {
+                        posix_madvise(mapped, (size_t)st.st_size, POSIX_MADV_RANDOM);
+                        const auto* bytes = (const uint8_t*)mapped;
+                        uint32_t head[2]{};
+                        uint64_t kept = 0;
+                        std::memcpy(head, bytes, 8);
+                        std::memcpy(&kept, bytes + 8, 8);
+                        if (head[0] == kDiskMagic && kept == stamp) {
+                            good = 16;
+                            whole = st.st_size;
+                            while (good + 20 <= whole) {
+                                uint64_t rec[2];
+                                uint32_t kind = 0;
+                                std::memcpy(rec, bytes + good, 16);
+                                std::memcpy(&kind, bytes + good + 16, 4);
+                                if (good + 16 + (int64_t)rec[1] > whole) break;
+                                disk_records[rec[0]].push_back({good + 16, (size_t)rec[1], kind});
+                                if (rec[1] > (64u << 10)) {
+                                    const uintptr_t payload = (uintptr_t)(bytes + good + 16);
+                                    const uintptr_t start = (payload + 4095) & ~(uintptr_t)4095;
+                                    const uintptr_t end = (payload + rec[1]) & ~(uintptr_t)4095;
+                                    if (end > start) posix_madvise((void*)start, end - start, POSIX_MADV_DONTNEED);
+                                }
+                                good += 16 + (int64_t)rec[1];
+                            }
+                        }
+                        if (!good || good != whole) {
+                            munmap(mapped, (size_t)st.st_size);
+                            mapped = MAP_FAILED;
+                        }
+                        if (mapped != MAP_FAILED) {
+                            posix_madvise(mapped, (size_t)good, POSIX_MADV_DONTNEED);
+                            disk_map = (uint8_t*)mapped;
+                            disk_map_size = (size_t)good;
+                            logf("vk: program cache mapped (%lld MB on disk, index only; payloads not kept resident). RX_VK_LOW_PROGRAMS=0 reads it through stdio",
+                                 (long long)(good >> 20));
+                        }
+                    }
+                }
+                close(fd);
+            }
+        }
+        const bool indexed = good != 0;
+#else
+        const bool indexed = false;
+#endif
+        if (!indexed)
         if (FILE* f = fopen(path.c_str(), "rb")) {
             _fseeki64(f, 0, SEEK_END);
             whole = _ftelli64(f);
@@ -856,6 +920,23 @@ void disk_init() {
             if (good != whole) {   // (a record cut short: without it)
                 if (FILE* f = fopen(path.c_str(), "r+b")) _chsize_s(_fileno(f), good), fclose(f);
             }
+#ifndef _WIN32
+            if (!disk_map && low_mem_on("RX_VK_LOW_PROGRAMS")) {
+                const int fd = open(path.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                    void* mapped = mmap(nullptr, (size_t)good, PROT_READ, MAP_PRIVATE, fd, 0);
+                    if (mapped != MAP_FAILED) {
+                        posix_madvise(mapped, (size_t)good, POSIX_MADV_DONTNEED);
+                        disk_map = (uint8_t*)mapped;
+                        disk_map_size = (size_t)good;
+                        logf("vk: program cache mapped (%lld MB on disk, index only; payloads not kept resident). RX_VK_LOW_PROGRAMS=0 reads it through stdio",
+                             (long long)(good >> 20));
+                    }
+                    close(fd);
+                }
+            }
+#endif
             disk_out = fopen(path.c_str(), "ab");
         } else {
             disk_out = fopen(path.c_str(), "wb");
@@ -982,7 +1063,17 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
     }
     for (const DiskRecord& d : recs) {
         std::vector<uint8_t> data(d.size);
-        {
+        if (disk_map && d.at >= 0 && (uint64_t)d.at + d.size <= disk_map_size) {
+            std::memcpy(data.data(), disk_map + d.at, d.size);
+#ifndef _WIN32
+            if (d.size > (64u << 10)) {
+                const uintptr_t payload = (uintptr_t)(disk_map + d.at);
+                const uintptr_t start = (payload + 4095) & ~(uintptr_t)4095;
+                const uintptr_t end = (payload + d.size) & ~(uintptr_t)4095;
+                if (end > start) posix_madvise((void*)start, end - start, POSIX_MADV_DONTNEED);
+            }
+#endif
+        } else {
             std::lock_guard lk(disk_mu);
             _fseeki64(disk_in, d.at, SEEK_SET);
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;

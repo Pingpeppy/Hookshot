@@ -576,8 +576,26 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
 struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0; };
 std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
-constexpr size_t kKeep = 24;
-constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
+// 24 captures and 768 MB kept the Deck at "24 captures kept (397 MB)" on top of a full texture set.
+// Low memory: 6 and 96 MB, unless RX_VK_CAPTURE_KEEP / RX_VK_CAPTURE_MB say otherwise, or RX_VK_LOW_CAPTURES=0.
+size_t cap_keep() {
+    static const size_t n = [] {
+        if (const char* e = getenv("RX_VK_CAPTURE_KEEP")) return (size_t)std::max(1, atoi(e));
+        if (low_mem_on("RX_VK_LOW_CAPTURES")) {
+            logf("vk: captures kept down to 6 and 96 MB (low memory; RX_VK_CAPTURE_KEEP / RX_VK_CAPTURE_MB, or RX_VK_LOW_CAPTURES=0)");
+            return (size_t)6;
+        }
+        return (size_t)24;
+    }();
+    return n;
+}
+uint64_t cap_bytes_max() {
+    static const uint64_t n = []() -> uint64_t {
+        if (const char* e = getenv("RX_VK_CAPTURE_MB")) return (uint64_t)std::max(1, atoi(e)) << 20;
+        return low_mem_on("RX_VK_LOW_CAPTURES") ? (96ull << 20) : (768ull << 20);
+    }();
+    return n;
+}
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
 struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; };
 std::vector<FreeBuf> cap_free;
@@ -590,7 +608,8 @@ bool sync_live() {
 std::mutex cap_free_mu;   // (the submitting threads take buffers from cap_free, the replay gives them back)
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     std::lock_guard lk(cap_free_mu);
-    if (cap_free.size() < 12 && size <= (64ull << 20)) cap_free.push_back({buffer, alloc, map, size});
+    const size_t spare_cap = low_mem_on("RX_VK_LOW_CAPTURES") ? 2 : 12;
+    if (cap_free.size() < spare_cap && size <= (64ull << 20)) cap_free.push_back({buffer, alloc, map, size});
     else destroy_buffer(buffer, alloc);
 }
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
@@ -1184,7 +1203,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     // (captures past the last kKeep, or past the byte budget, retired once the work that read them is done)
     while (!cap_bufs.empty()) {
         auto oldest = cap_bufs.begin();
-        const bool over = cap_bufs.size() > kKeep || cap_bytes > kCapBytesMax;
+        const bool over = cap_bufs.size() > cap_keep() || cap_bytes > cap_bytes_max();
         if (!over || std::max(oldest->second.value, oldest->second.last_use) > completed) break;
         cap_buf_retire(oldest);
     }
@@ -1241,7 +1260,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     {
         std::lock_guard lk(cap_mu);
-        if (spare.size() < 8) spare.push_back(std::move(c));
+        if (spare.size() < (low_mem_on("RX_VK_LOW_CAPTURES") ? 2 : 8)) spare.push_back(std::move(c));
     }
     {   // (every 600 takes: where a take's time went)
         const auto tk2 = std::chrono::steady_clock::now();
@@ -1426,7 +1445,8 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (guest < it->lo || guest >= it->hi || !size || size > it->hi - guest) return nullptr;
     // (imports by 16 MB chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as
     // their number grew, and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
-    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
+    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB")))
+                                                                         : low_mem_on("RX_VK_LOW_IMPORT") ? 8 : 16) << 20;
     const GuestPool range = chunk ? GuestPool{guest, guest + size} : *it;
     auto covering = [&]() {
         auto c = imported.upper_bound(range.lo);
@@ -1576,12 +1596,16 @@ uint64_t mirror_budget() {
         // (cards of 6 GB or less only: on 8 GB ones, a 3070 or a 4060, the game's memory read over PCIe instead left the GPU at a few
         // percent and the frame stuttering)
         if (vram && vram <= (6ull << 30) + (512ull << 20)) return vram / 8;
-        return vram ? std::min<uint64_t>(vram / 4, 3072ull << 20) : (uint64_t)(3072ull << 20);
+        uint64_t cap = vram ? std::min<uint64_t>(vram / 4, 3072ull << 20) : (uint64_t)(3072ull << 20);
+        // A shared-memory APU pays for a mirror out of the same RAM as the game. 256 MB unless the env set a size.
+        if (low_mem_on("RX_VK_LOW_MIRROR") && cap > (256ull << 20)) cap = 256ull << 20;
+        return cap;
     }();
     // (the Insert menu's quality preset sets one, 256 MB at Minimum (4GB): it was never read, and an 8 GB card kept ~2 GB of
     // mirrors with the 4GB preset on, 2026-11-08)
-    if (opts.mirror_mb > 0 && !getenv("RX_VK_MIRROR_MB")) return (uint64_t)opts.mirror_mb << 20;
-    return b;
+    uint64_t cap = (opts.mirror_mb > 0 && !getenv("RX_VK_MIRROR_MB")) ? ((uint64_t)opts.mirror_mb << 20) : b;
+    if (low_mem_on("RX_VK_LOW_MIRROR") && !getenv("RX_VK_MIRROR_MB") && cap > (256ull << 20)) cap = 256ull << 20;
+    return cap;
 }
 uint64_t mirror_bytes = 0, mirror_epoch = 0;
 bool mirror_upload = false;   // (a submission is being recorded: its upload command buffer takes the syncs)

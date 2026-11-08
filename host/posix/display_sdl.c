@@ -10,9 +10,11 @@
 #include "../hos.h"
 #include <dlfcn.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <windows.h>
 #include "../../gpu/vk/vk_api.h"
 
@@ -203,8 +205,54 @@ void hos_display_start(void) {
     __atomic_store_n(&start_asked, 1, __ATOMIC_RELEASE);
 }
 
+/* "window closed, exiting" is only this file (SDL quit or the window manager's close) and host/display.c's WM_CLOSE.
+   Nothing in the renderer posts it: a failed allocation logs "C++ allocation failed", a present failure logs
+   "present returned", and the kernel's OOM killer is SIGKILL, which cannot be logged. Gamescope closing the client
+   under memory pressure arrives here as WE_CLOSE. */
+static void log_resident(const char *why) {
+    unsigned long rss = 0, peak = 0, avail = 0, swap = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long kb = 0;
+            if (sscanf(line, "VmRSS: %lu", &kb) == 1) rss = kb;
+            else if (sscanf(line, "VmHWM: %lu", &kb) == 1) peak = kb;
+        }
+        fclose(f);
+    }
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long kb = 0;
+            if (sscanf(line, "MemAvailable: %lu", &kb) == 1) avail = kb;
+            else if (sscanf(line, "SwapFree: %lu", &kb) == 1) swap = kb;
+        }
+        fclose(f);
+    }
+    hos_log("display: %s. RSS %lu MB, peak RSS %lu MB, MemAvailable %lu MB, swap free %lu MB. "
+            "This is not a GPU reset.",
+            why, rss >> 10, peak >> 10, avail >> 10, swap >> 10);
+    if (avail && avail < 400ul * 1024)
+        hos_log("display: memory was critically low when the window went away. The compositor can close a client "
+                "for that. An allocation failure uses a different log line.");
+    hos_log_flush();
+}
+static void on_signal(int sig) {
+    /* write() only: this can run on top of malloc. The SDL close path logs RSS. */
+    const char* line = sig == SIGTERM ? "[hos host] display: SIGTERM, exiting (not a GPU reset)\n"
+                       : sig == SIGINT ? "[hos host] display: SIGINT, exiting (not a GPU reset)\n"
+                                       : "[hos host] display: SIGHUP, exiting (not a GPU reset)\n";
+    write(2, line, strlen(line));
+    _exit(128 + sig);
+}
+
 /* the main thread's loop, until the process ends: the window once asked for, then its events */
 void hos_display_loop(void) {
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
+    signal(SIGHUP, on_signal);
     if (!sdl_ready) {
         for (;;) Sleep(1000);
     }
@@ -234,8 +282,7 @@ void hos_display_loop(void) {
             do {
                 switch (e.type) {
                 case EV_QUIT:
-                    hos_log("display: window closed, exiting");
-                    hos_log_flush();
+                    log_resident("SDL_QUIT, window closed, exiting");
                     ExitProcess(0);
                 case EV_WINDOW: {
                     const uint8_t what = e.raw[12];
@@ -249,8 +296,7 @@ void hos_display_loop(void) {
                         if (what == WE_FOCUS_LOST) hos_posix_window[0] = 0;
                         mouse_capture(0);
                     } else if (what == WE_CLOSE) {
-                        hos_log("display: window closed, exiting");
-                        hos_log_flush();
+                        log_resident("SDL_WINDOWEVENT_CLOSE, window closed, exiting");
                         ExitProcess(0);
                     }
                     break;

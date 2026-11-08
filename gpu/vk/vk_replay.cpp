@@ -3028,6 +3028,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     res = vkQueuePresentKHR(dev.queue, &pi);
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR)
         create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
+    else if (res != VK_SUCCESS) {
+        static int logged;
+        if (logged++ < 8)
+            logf("vk: present returned %d. Swapchain loss recreates the swapchain and does not close the window; "
+                 "out-of-memory results are %d and %d",
+                 (int)res, (int)VK_ERROR_OUT_OF_HOST_MEMORY, (int)VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
 }
 
 

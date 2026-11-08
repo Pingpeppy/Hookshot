@@ -8,6 +8,12 @@
 // Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
 #include <algorithm>
 #include <filesystem>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -520,10 +526,31 @@ void pcache_init() {
     dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     pcache_path = dir + "mkw_vk_pipelines.bin";
     std::vector<uint8_t> data;
+    void* mapped = nullptr;
+    size_t mapped_size = 0;
+#ifndef _WIN32
+    // The driver's copy is made inside vkCreatePipelineCache. Mapping avoids a second heap copy of the file, and the
+    // mapping is dropped as soon as the cache object exists.
+    if (low_mem_on("RX_VK_LOW_PIPELINES")) {
+        const int fd = open(pcache_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st{};
+            if (fstat(fd, &st) == 0 && st.st_size > 32) {
+                mapped = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (mapped != MAP_FAILED) {
+                    mapped_size = (size_t)st.st_size;
+                    posix_madvise(mapped, mapped_size, POSIX_MADV_SEQUENTIAL);
+                } else mapped = nullptr;
+            }
+            close(fd);
+        }
+    }
+#endif
+    if (!mapped)
     if (FILE* f = fopen(pcache_path.c_str(), "rb")) {
-        fseek(f, 0, SEEK_END);
-        const long sz = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        _fseeki64(f, 0, SEEK_END);
+        const int64_t sz = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
         if (sz > 32) {
             data.resize((size_t)sz);
             if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
@@ -531,22 +558,30 @@ void pcache_init() {
         fclose(f);
     }
     // (data of another device or driver is dropped before Vulkan sees it)
-    if (data.size() >= 32) {
+    const uint8_t* initial = mapped ? (const uint8_t*)mapped : data.empty() ? nullptr : data.data();
+    size_t initial_size = mapped ? mapped_size : data.size();
+    if (initial && initial_size >= 32) {
         uint32_t vendor, device;
-        std::memcpy(&vendor, data.data() + 8, 4);
-        std::memcpy(&device, data.data() + 12, 4);
+        std::memcpy(&vendor, initial + 8, 4);
+        std::memcpy(&device, initial + 12, 4);
         if (vendor != dev.props.vendorID || device != dev.props.deviceID ||
-            std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
-            data.clear();
+            std::memcmp(initial + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
+            initial = nullptr, initial_size = 0;
     }
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    ci.initialDataSize = data.size();
-    ci.pInitialData = data.empty() ? nullptr : data.data();
+    ci.initialDataSize = initial_size;
+    ci.pInitialData = initial_size ? initial : nullptr;
     if (vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache) != VK_SUCCESS) {
         ci.initialDataSize = 0, ci.pInitialData = nullptr;
         vkCreatePipelineCache(dev.device, &ci, nullptr, &pcache);
     }
-    logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
+#ifndef _WIN32
+    if (mapped) {
+        posix_madvise(mapped, mapped_size, POSIX_MADV_DONTNEED);
+        munmap(mapped, mapped_size);
+    }
+#endif
+    logf("vk: pipeline cache %s (%zu KB%s)", pcache_path.c_str(), initial_size >> 10, mapped ? ", mapped and released" : "");
 }
 
 struct Targets {

@@ -158,7 +158,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return renderer ? 1 : DefWindowProcA(w, msg, wp, lp);
     case WM_CLOSE:
-        hos_log("display: window closed, exiting");
+        hos_log("display: WM_CLOSE, window closed, exiting (a window-manager close, not a GPU reset and not an allocation failure)");
         hos_log_flush();
         ExitProcess(0);
         return 0;

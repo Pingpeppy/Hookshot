@@ -18,6 +18,7 @@
 #include <psapi.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1308,8 +1309,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     {   // huge textures leave out their top levels: wider than RX_VK_TEX_MAX_DIM (default 2048) once they would take
         // 64 MB, and down to RX_VK_TEX_MAX_MB (default 512) whatever their size (MKW's terrain material arrays are
         // 8192 x 8192 x 68 ASTC: 24 GB as RGBA8)
-        static const uint32_t max_dim = getenv("RX_VK_TEX_MAX_DIM") ? (uint32_t)atoi(getenv("RX_VK_TEX_MAX_DIM")) : 2048;
-        static const uint64_t max_bytes = (uint64_t)(getenv("RX_VK_TEX_MAX_MB") ? atoi(getenv("RX_VK_TEX_MAX_MB")) : 1536) << 20;
+        // Low memory drops the top mips of a texture sooner (1024 px, 256 MB) so a 4K set is not decoded whole.
+        static const uint32_t max_dim = getenv("RX_VK_TEX_MAX_DIM") ? (uint32_t)atoi(getenv("RX_VK_TEX_MAX_DIM"))
+                                                                    : low_mem_on("RX_VK_LOW_TEX") ? 1024 : 2048;
+        static const uint64_t max_bytes = (uint64_t)(getenv("RX_VK_TEX_MAX_MB") ? atoi(getenv("RX_VK_TEX_MAX_MB"))
+                                                                                : low_mem_on("RX_VK_LOW_TEX") ? 256 : 1536) << 20;
+        static const uint64_t astc_mip_cap = (uint64_t)(getenv("RX_VK_TEX_LEVEL_MB") ? atoi(getenv("RX_VK_TEX_LEVEL_MB"))
+                                                                                     : low_mem_on("RX_VK_LOW_TEX") ? 32 : 64) << 20;
         const uint32_t texel = astc ? 4 : std::max(1, bpb / std::max(1, bw * bh));
         auto bytes_at = [&](uint32_t skip) {
             uint64_t px = 0;
@@ -1329,7 +1335,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                                                            u, VK_IMAGE_TILING_OPTIMAL, &np, nullptr);
             x.sparse = np > 0;
         }
-        while (!x.sparse && astc && x.skip + 1 < x.levels && bytes_at(x.skip) > (64ull << 20) &&
+        while (!x.sparse && astc && x.skip + 1 < x.levels && bytes_at(x.skip) > astc_mip_cap &&
                (std::max(x.width, x.height) >> x.skip) > max_dim)
             x.skip++;
         while (!x.sparse && x.skip + 1 < x.levels && bytes_at(x.skip) > max_bytes) x.skip++;
@@ -2569,7 +2575,8 @@ void texture_frame(uint64_t completed) {
     frame_no++;
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
-        static const uint64_t keep = (uint64_t)(getenv("RX_VK_STAGING_KEEP_MB") ? atoi(getenv("RX_VK_STAGING_KEEP_MB")) : 256) << 20;
+        static const uint64_t keep = (uint64_t)(getenv("RX_VK_STAGING_KEEP_MB") ? atoi(getenv("RX_VK_STAGING_KEEP_MB"))
+                                                                             : low_mem_on("RX_VK_LOW_STAGING") ? 48 : 256) << 20;
         uint64_t kept = 0;
         for (auto it = arenas.begin(); it != arenas.end();) {
             const bool idle = it->value <= completed && it->value != rec_value;
@@ -2581,13 +2588,36 @@ void texture_frame(uint64_t completed) {
             kept += it->size;
             ++it;
         }
-        if (frame_no % 600 == 0) {   // (the process's memory now and then: what the host side holds)
+        const uint64_t mem_every = low_mem_mode() ? 120 : 600;
+        if (frame_no % mem_every == 0) {   // (the process's memory now and then: what the host side holds)
             PROCESS_MEMORY_COUNTERS_EX pm{};
             pm.cb = sizeof pm;
-            if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm))
-                logf("vk: memory: working set %llu MB (peak %llu), private %llu MB, staging %llu MB in %zu arenas",
+            unsigned long long avail_kb = 0, swap_kb = 0;
+            uint64_t gpu_used = 0, gpu_allowed = 0;
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm)) {
+#ifndef _WIN32
+                if (FILE* mf = fopen("/proc/meminfo", "r")) {
+                    char line[128];
+                    while (fgets(line, sizeof line, mf)) {
+                        unsigned long long kb = 0;
+                        if (sscanf(line, "MemAvailable: %llu", &kb) == 1) avail_kb = kb;
+                        else if (sscanf(line, "SwapFree: %llu", &kb) == 1) swap_kb = kb;
+                    }
+                    fclose(mf);
+                }
+#endif
+                uint64_t block_free = 0;
+                vram_usage(&gpu_used, &gpu_allowed, &block_free);
+                logf("vk: memory: RSS %llu MB (peak %llu), private %llu MB, MemAvailable %llu MB, swap free %llu MB, "
+                     "GPU %llu/%llu MB, staging %llu MB in %zu arenas, textures %llu MB",
                      (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20),
-                     (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(kept >> 20), arenas.size());
+                     (unsigned long long)(pm.PrivateUsage >> 20), avail_kb >> 10, swap_kb >> 10,
+                     (unsigned long long)(gpu_used >> 20), (unsigned long long)(gpu_allowed >> 20),
+                     (unsigned long long)(kept >> 20), arenas.size(), (unsigned long long)(total_bytes >> 20));
+                if (avail_kb && avail_kb < 400ull * 1024)
+                    logf("vk: memory critically low (%llu MB available). A compositor may close the window; that log line is not a GPU reset",
+                         avail_kb >> 10);
+            }
         }
     }
     for (auto it = dead.begin(); it != dead.end();) {
@@ -2613,6 +2643,12 @@ void texture_frame(uint64_t completed) {
                                                                                              // card's 10.8 GB filled up, read as a leak: 105, 106)
                                      : 4096ull << 20;
     uint64_t budget = (opts.vram_mb > 0) ? ((uint64_t)opts.vram_mb << 20) : own;
+    if (low_mem_on("RX_VK_LOW_TEX") && !getenv("RX_VK_VRAM_MB") && budget > (1280ull << 20)) {
+        static int capped;
+        if (!capped++)
+            logf("vk: texture budget capped at 1280 MB (low memory; RX_VK_VRAM_MB sets it, RX_VK_LOW_TEX=0 leaves the preset)");
+        budget = 1280ull << 20;
+    }
     if (opts.vram_mb > 0 && known) {
         // Safety clamp: do not exceed 75% of driver-allowed memory on constrained VRAM (prevents VK_ERROR_DEVICE_LOST)
         budget = std::min(budget, (allowed / 4) * 3);
@@ -2724,7 +2760,8 @@ void texture_frame(uint64_t completed) {
     // 40 frames came back empty each time (22 times; the lit ground black for a frame, a tiled pattern over the ground).
     // With 60: 2. The textures that are really done with still go, 52 frames later)
     static const uint64_t min_unused =
-        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;
+        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED")))
+                                         : low_mem_on("RX_VK_LOW_TEX") ? 30 : 60;
     for (auto& [last, tex] : order) {
         if ((!sweep && total_bytes <= budget / 8 * 7) || frame_no - last < (sweep ? std::max<uint64_t>(120, min_unused) : min_unused)) break;
         if (tex->last_value > completed) continue;
@@ -2735,7 +2772,9 @@ void texture_frame(uint64_t completed) {
         // (one unused for 3600 presents (a minute) goes: a course left behind; the game draws it again when it comes
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
         // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
-        const uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
+        uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
+        if (low_mem_on("RX_VK_LOW_TEX") && !getenv("RX_VK_EVICT_RENDERED"))
+            keep_rendered = std::min(keep_rendered, (uint64_t)900);
         // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
         // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
         // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the

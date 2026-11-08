@@ -570,8 +570,9 @@ static void deck_profile(void) {
     if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
     if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
     if (!getenv("RX_VK_DECK")) setenv("RX_VK_DECK", "1", 0);
-    fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap). "
-                    "RX_VK_DECK=0 turns the profile off.\n");
+    fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap, "
+                    "low-memory texture, capture, program-cache and staging limits). "
+                    "RX_VK_DECK=0 turns the profile off. RX_VK_LOW_MEM=0 turns the memory limits off.\n");
 }
 /* (linux) The window belongs on the process's main thread (SDL), so the game runs on a thread of its own, with the
    stack the guest main thread's lifted code needs (the main thread has the system's 8 MB): host/posix/display_sdl.c */
