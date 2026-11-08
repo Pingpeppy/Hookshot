@@ -187,8 +187,15 @@ def fn_cost(size):
     return size + size * size // QUAD
 
 
+def as_lf(text):
+    """\\n line endings. A file checked out or written on Windows is CRLF; costing those extra bytes, then reading the
+    parts back as \\n, left the part after a giant function a sliver under its share."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def text_cost(text):
     """The estimated compile cost of a C file of lifted functions"""
+    text = as_lf(text)
     marks = [m.start() for m in HEAD.finditer(text)] + [len(text)]
     return marks[0] + sum(fn_cost(b - a) for a, b in zip(marks, marks[1:]))
 
@@ -219,7 +226,7 @@ def split_big(gen_dir, files, budget=None):
         if not m:
             continue
         with open(path, encoding="utf-8", newline="") as f:
-            text = f.read()
+            text = as_lf(f.read())
         marks = [h.start() for h in HEAD.finditer(text)]
         ends = marks[1:] + [len(text)]
         cost = [fn_cost(b - a) for a, b in zip(marks, ends)]

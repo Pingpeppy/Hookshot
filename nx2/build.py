@@ -246,7 +246,7 @@ def mem_need(src):
         return 1500
     if name.startswith("code_"):
         with open(src, "rb") as f:
-            text = f.read()
+            text = f.read().replace(b"\r\n", b"\n")   # (a definition ends in '{' ; CRLF made that '\\r' and the giant was missed)
         starts, at = [], text.find(b"\nvoid f_")
         while at >= 0:
             if text.endswith(b"{", 0, text.find(b"\n", at + 1)):   # (a definition, not one of the declarations above them)
