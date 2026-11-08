@@ -28,6 +28,12 @@
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "import_hold.h"
+#ifdef __linux__
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 namespace mkwvk {
 namespace {
@@ -38,6 +44,7 @@ struct Pool {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
+    std::vector<VkDeviceMemory> pieces;   // (a pool imported as several dma-bufs: the ones after `memory`)
     // its VRAM mirror (see "the VRAM mirror" below)
     enum : uint8_t { MIRROR_NONE, MIRROR_WANTED, MIRROR_ON, MIRROR_REFUSED } mstate = MIRROR_NONE;
     VkBuffer mirror = VK_NULL_HANDLE;
@@ -96,11 +103,193 @@ void import_remember_failure(uint64_t lo, uint64_t hi) {
     import_holds.deny_for(lo, hi, import_now_ms());
 }
 
+void free_import(VkBuffer buffer, VkDeviceMemory memory, const std::vector<VkDeviceMemory>& pieces) {
+    if (buffer) vkDestroyBuffer(dev.device, buffer, nullptr);
+    if (memory) vkFreeMemory(dev.device, memory, nullptr);
+    for (VkDeviceMemory m : pieces)
+        if (m) vkFreeMemory(dev.device, m, nullptr);
+}
+
 constexpr VkBufferUsageFlags kUsage =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
     VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+
+#ifdef __linux__
+// Guest memory handed to the GPU as a dma-buf over the game's own pages (RufflezAU, from AzleKayn's
+// linux/udmabuf-guest-memory). The window is a memfd (host/hos_main.c) and /dev/udmabuf makes a dma-buf of a range,
+// which the device imports. The pages are the ones the game reads. A host-pointer import is a userptr object whose
+// pages amdgpu looks up again at every submission. A pool larger than udmabuf's size limit is several dma-bufs in one
+// sparse buffer. RX_VK_NO_DMABUF=1: host pointers only. RX_VK_DMABUF_PIECE_MB=<n>: smaller pieces.
+struct UdmabufCreate { uint32_t memfd, flags; uint64_t offset, size; };
+constexpr unsigned long kUdmabufCreate = (1ul << 30) | (sizeof(UdmabufCreate) << 16) | ('u' << 8) | 0x42;
+int dmabuf_memfd = -2, dmabuf_dev = -1, dmabuf_failures = 0;
+uint64_t dmabuf_limit = 0;
+
+VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size) {
+    UdmabufCreate c{(uint32_t)dmabuf_memfd, 1, lo, size};
+    const int fd = ioctl(dmabuf_dev, kUdmabufCreate, &c);
+    if (fd < 0) {
+        if (dmabuf_failures++ < 8)
+            logf("vk: guest %#llx..%#llx: no udmabuf (errno %d)", (unsigned long long)lo, (unsigned long long)(lo + size), errno);
+        return VK_NULL_HANDLE;
+    }
+    static uint32_t type = UINT32_MAX;
+    if (type == UINT32_MAX) {
+        VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+        if (vkGetMemoryFdPropertiesKHR(dev.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
+                if ((fp.memoryTypeBits >> i & 1) &&
+                    (dev.memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                    type = i;
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
+                if (fp.memoryTypeBits >> i & 1) type = i;
+        }
+        if (type == UINT32_MAX) {
+            close(fd);
+            if (dmabuf_failures++ < 8) logf("vk: a dma-buf of guest memory has no memory type");
+            return VK_NULL_HANDLE;
+        }
+    }
+    VkImportMemoryFdInfoKHR im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+    im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    im.fd = fd;
+    VkMemoryAllocateFlagsInfo fl{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    im.pNext = &fl;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &im;
+    ai.allocationSize = size;
+    ai.memoryTypeIndex = type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    const VkResult r = vkAllocateMemory(dev.device, &ai, nullptr, &memory);
+    if (r != VK_SUCCESS) {
+        close(fd);
+        if (dmabuf_failures++ < 8)
+            logf("vk: guest %#llx..%#llx: its dma-buf not imported (VkResult %d)", (unsigned long long)lo,
+                 (unsigned long long)(lo + size), (int)r);
+        return VK_NULL_HANDLE;
+    }
+    return memory;
+}
+
+bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
+    VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.pNext = &eb;
+    bi.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
+    bi.size = hi - lo;
+    bi.usage = kUsage;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(dev.device, buffer, &req);
+    const uint64_t align = std::max<uint64_t>(req.alignment, 4096);
+    piece = piece / align * align;
+    const uint64_t end = lo + req.size;
+    if (!piece || (req.size & 4095) || end > host->guest_size()) {
+        vkDestroyBuffer(dev.device, buffer, nullptr);
+        return false;
+    }
+    std::vector<VkDeviceMemory> memories;
+    std::vector<VkSparseMemoryBind> binds;
+    for (uint64_t off = 0; off < req.size; off += piece) {
+        const uint64_t n = std::min(piece, req.size - off);
+        const VkDeviceMemory m = dma_buf_memory(lo + off, n);
+        if (!m) break;
+        memories.push_back(m);
+        binds.push_back({off, n, m, 0, 0});
+    }
+    VkResult res = VK_ERROR_UNKNOWN;
+    if (!memories.empty() && binds.size() == (req.size + piece - 1) / piece) {
+        VkSparseBufferMemoryBindInfo bb{buffer, (uint32_t)binds.size(), binds.data()};
+        VkBindSparseInfo si{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        si.bufferBindCount = 1;
+        si.pBufferBinds = &bb;
+        static VkFence fence = VK_NULL_HANDLE;
+        static std::mutex fence_mu;
+        std::lock_guard fk(fence_mu);
+        if (!fence) {
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(dev.device, &fi, nullptr, &fence);
+        }
+        {
+            std::lock_guard qk(dev.present_mu);
+            queue_flush_locked();
+            res = vkQueueBindSparse(dev.queue, 1, &si, fence);
+        }
+        if (res == VK_SUCCESS) {
+            res = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(dev.device, 1, &fence);
+        }
+    }
+    if (res != VK_SUCCESS) {
+        free_import(buffer, VK_NULL_HANDLE, memories);
+        return false;
+    }
+    p.lo = lo, p.hi = hi, p.buffer = buffer, p.memory = memories[0];
+    p.pieces.assign(memories.begin() + 1, memories.end());
+    return true;
+}
+
+bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
+    static uint64_t piece = 0;
+    if (dmabuf_memfd == -2) {
+        dmabuf_memfd = -1;
+        typedef int (*MemfdFn)(void);
+        const MemfdFn fn = getenv("RX_VK_NO_DMABUF") ? nullptr : (MemfdFn)dlsym(RTLD_DEFAULT, "hos_posix_guest_memfd");
+        const int fd = fn ? fn() : -1;
+        if (fd >= 0 && dev.dma_buf_import && vkGetMemoryFdPropertiesKHR) dmabuf_dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (fd >= 0 && dmabuf_dev >= 0) {
+            dmabuf_memfd = fd;
+            dmabuf_limit = 64ull << 20;
+            if (FILE* f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+                unsigned long long mb = 0;
+                if (fscanf(f, "%llu", &mb) == 1 && mb) dmabuf_limit = mb << 20;
+                fclose(f);
+            }
+            piece = dmabuf_limit;
+            if (const char* e = getenv("RX_VK_DMABUF_PIECE_MB"))
+                if (atoll(e) > 0) piece = std::min<uint64_t>(piece, (uint64_t)atoll(e) << 20);
+        }
+        logf("vk: guest memory as dma-bufs: %s", dmabuf_memfd >= 0 ? "yes" : !fn ? "no (no memfd window, or RX_VK_NO_DMABUF)"
+                 : fd < 0 ? "no (the window is anonymous memory)" : !dev.dma_buf_import ? "no (VK_EXT_external_memory_dma_buf)"
+                 : "no (/dev/udmabuf cannot be opened)");
+    }
+    if (dmabuf_memfd < 0 || (lo & 4095) || (hi & 4095)) return false;
+    if (hi - lo > piece) {
+        if (!dev.sparse_binding || !import_dma_buf_pieces(lo, hi, piece, p)) return false;
+    } else {
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.pNext = &eb;
+        bi.size = hi - lo;
+        bi.usage = kUsage;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
+        const VkDeviceMemory memory = dma_buf_memory(lo, hi - lo);
+        if (!memory) {
+            vkDestroyBuffer(dev.device, buffer, nullptr);
+            return false;
+        }
+        vkBindBufferMemory(dev.device, buffer, memory, 0);
+        p.lo = lo, p.hi = hi, p.buffer = buffer, p.memory = memory;
+    }
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = p.buffer;
+    p.address = vkGetBufferDeviceAddress(dev.device, &da);
+    static int64_t n = 0, bytes = 0;
+    n++, bytes += (int64_t)(hi - lo);
+    if (n <= 4 || n % 64 == 0)
+        logf("vk: pool %#llx..%#llx a dma-buf%s (%lld so, %lld MB)", (unsigned long long)lo, (unsigned long long)hi,
+             p.pieces.empty() ? "" : "s in a sparse buffer", (long long)n, (long long)(bytes >> 20));
+    return true;
+}
+#endif
 
 bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     import_cooling = false;
@@ -142,6 +331,12 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
             q = end;
         }
     }
+#ifdef __linux__
+    if (import_dma_buf(lo, hi, p)) {
+        t1 = t2 = t3 = t4 = clk::now();
+        return true;
+    }
+#endif
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
@@ -1349,8 +1544,7 @@ void bg_drain() {
     for (auto& [lo, p] : ready) {
         auto imp = imported.find(lo);
         if (imp != imported.end() && imp->second.hi >= p.hi) {
-            vkDestroyBuffer(dev.device, p.buffer, nullptr);
-            vkFreeMemory(dev.device, p.memory, nullptr);
+            free_import(p.buffer, p.memory, p.pieces);
             continue;
         }
         bool overlap = false;   // (amd-fix: a chunk imported ahead that an import made since covers in part: the pools stay disjoint)
@@ -1366,8 +1560,7 @@ void bg_drain() {
         }
         if (overlap) {
             st_prefetch_dropped++;
-            vkDestroyBuffer(dev.device, p.buffer, nullptr);
-            vkFreeMemory(dev.device, p.memory, nullptr);
+            free_import(p.buffer, p.memory, p.pieces);
             continue;
         }
         if (imp != imported.end()) retire_pool(imp);
@@ -2032,7 +2225,13 @@ std::deque<DeadMirror> dead_mirrors;
 // Forest ~1.3 GB of imports, 15-45 ms a submission (3-4 fps on an RX 7800 XT with 11 ms of GPU time; issues 312, 413). Its
 // table entries went at its retirement, and its mirror goes before (mstate), so once the GPU is past retired_value nothing
 // reaches it. The node stays (pointers to it are kept elsewhere); only its buffer and memory go. RX_VK_KEEP_RETIRED=1: kept
-struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; };
+struct DeadImport {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    std::vector<VkDeviceMemory> pieces;
+    uint64_t value;
+    uint64_t bytes;
+};
 std::deque<DeadImport> dead_imports;
 uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
 void reap_mirrors() {   // (pools_mu held)
@@ -2047,8 +2246,7 @@ void reap_mirrors() {   // (pools_mu held)
         dead_mirrors.pop_front();
     }
     while (!dead_imports.empty() && dead_imports.front().value <= mem_completed) {
-        vkDestroyBuffer(dev.device, dead_imports.front().buffer, nullptr);
-        vkFreeMemory(dev.device, dead_imports.front().memory, nullptr);
+        free_import(dead_imports.front().buffer, dead_imports.front().memory, dead_imports.front().pieces);
         st_retired_imports_freed++, st_retired_import_bytes_freed += dead_imports.front().bytes;
         dead_imports.pop_front();
     }
@@ -2070,7 +2268,7 @@ void retired_imports_give_back() {   // (pools_mu held)
         if (!p.memory) continue;
         if (!keep && p.mstate == Pool::MIRROR_NONE && !p.inherit_pending && p.retired_value <= mem_completed &&
             p.last_value <= mem_completed) {
-            dead_imports.push_back({p.buffer, p.memory, std::max(mem_rec_value, p.last_value), p.hi - p.lo});
+            dead_imports.push_back({p.buffer, p.memory, std::move(p.pieces), std::max(mem_rec_value, p.last_value), p.hi - p.lo});
             p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
             pools_gen++;
             continue;
