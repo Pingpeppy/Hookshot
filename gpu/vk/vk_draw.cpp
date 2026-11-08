@@ -683,7 +683,9 @@ struct PipeEntry {
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
 std::atomic<uint64_t> pipeline_live{0};
+} // namespace
 uint64_t pipeline_count() { return pipeline_live.load(std::memory_order_relaxed); }
+namespace {
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (hookshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
