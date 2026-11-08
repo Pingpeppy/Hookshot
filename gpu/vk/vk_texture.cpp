@@ -3232,7 +3232,10 @@ void texture_frame(uint64_t completed) {
             if (tex->last_frame >= burst_at || tex->last_value > completed || baked) continue;
         } else {
         if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
-        if (ws_on && frame_no - tex->last_frame < min_presents) break;
+        // Over the working-set budget the keep is the same 8 presents the budget is built from. 90 presents kept
+        // about a second of idle textures (the run sat ~800 MB over its budget and swapped).
+        const uint64_t keep_frames = !sweep && ws_on ? 8 : min_presents;
+        if (ws_on && frame_no - tex->last_frame < keep_frames) break;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3253,7 +3256,10 @@ void texture_frame(uint64_t completed) {
             for (auto o = a; o != e && !overwritten; ++o)
                 overwritten = o->second != tex && o->second->last_written > tex->last_frame;
         }
-        if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && now_ms - last < keep_rendered_ms) continue;
+        // While the textures are over the working-set budget, a render target idle for those 8 presents goes too
+        // (flushed back first, below). Kept for 2 s, the old sizes stayed resident and the deck swapped.
+        const bool ws_squeeze = !sweep && ws_on;
+        if (!ws_squeeze && !overwritten && tex->gpu_written && !tex->released && !evict_rendered && now_ms - last < keep_rendered_ms) continue;
         if (sweep && !overwritten) continue;
         // (and a small one never: its texels exist nowhere else, and it is made once and kept by the game. The sky's
         // 256 x 256 lookup table, unused while a menu was up, went and came back from memory as garbage: the rainbow
@@ -3261,7 +3267,7 @@ void texture_frame(uint64_t completed) {
         // (a render target, drawn in the frames it was used in, goes: the dynamic resolution makes a new set of ~20 at
         // each size, and the old ones are not used again)
         const bool drawn_once = tex->last_written + 8 < tex->last_frame;
-        if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && tex->bytes < (64ull << 20) && drawn_once) continue;
+        if (!ws_squeeze && !overwritten && tex->gpu_written && !tex->released && !evict_rendered && tex->bytes < (64ull << 20) && drawn_once) continue;
         // (nor a small one the GPU wrote in one frame alone: a table the game bakes once and samples now and then. The
         // pause screen's colour grading, 8 x 8 x 8, its slices drawn at boot and sampled next when the game is paused,
         // went after a minute unused, and the one made again over storage only the GPU had written stayed empty: the
