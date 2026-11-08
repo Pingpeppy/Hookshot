@@ -599,6 +599,8 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
     if (radv_driver()) {
+        if (pipeline_creates_serialized())
+            logf("vk: pipeline creates serialized (RADV). RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
         const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH");
         logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
              vangogh ? " on Van Gogh" : "");
@@ -651,6 +653,26 @@ bool radv_driver() {
         return (int)dp.driverID;
     }();
     return id == VK_DRIVER_ID_MESA_RADV;
+}
+
+namespace {
+std::mutex pipeline_create_mu;
+}
+bool pipeline_creates_serialized() {
+    static const bool on = [] {
+        if (!radv_driver()) return false;
+        const char* e = getenv("RX_VK_PIPELINE_SERIAL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+PipelineCreateLock::PipelineCreateLock() {
+    if (!pipeline_creates_serialized()) return;
+    pipeline_create_mu.lock();
+    held = true;
+}
+PipelineCreateLock::~PipelineCreateLock() {
+    if (held) pipeline_create_mu.unlock();
 }
 
 bool radv_mesh_payload_barrier() {

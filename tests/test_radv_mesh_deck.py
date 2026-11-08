@@ -43,6 +43,11 @@ def main():
         raise SystemExit("vk_texture.cpp: a failed image view must log vkCreateImageView's result")
     if "vkGetPhysicalDeviceImageFormatProperties2" not in TEX or "refused by the driver" not in TEX:
         raise SystemExit("vk_texture.cpp: STORAGE on a compressed image must follow the format query")
+    VKMAIN = (ROOT / "gpu/vk/vk_main.cpp").read_text(encoding="utf-8")
+    if "pipeline creates serialized (RADV)" not in VKMAIN or "RX_VK_PIPELINE_SERIAL" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
+    if "hookshot_vk_pipelines.bin" not in DRAW or "PipelineCreateLock" not in DRAW:
+        raise SystemExit("vk_draw.cpp: the pipeline cache is Hookshot's, and creates take the RADV lock")
     print("radv mesh optimizer, payload barrier and deck profile ok")
 
 

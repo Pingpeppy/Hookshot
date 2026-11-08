@@ -31,6 +31,15 @@ void queue_flush();          // (the same, taking dev.present_mu)
 void pace_fps_cap();         // (RX_VK_FPS_CAP, before a present)
 bool radv_driver();
 bool radv_mesh_payload_barrier();
+/// RADV serializes vkCreate*Pipelines and vkGetPipelineCacheData. RX_VK_PIPELINE_SERIAL=0 leaves them parallel.
+bool pipeline_creates_serialized();
+struct PipelineCreateLock {
+    bool held = false;
+    PipelineCreateLock();
+    ~PipelineCreateLock();
+    PipelineCreateLock(const PipelineCreateLock&) = delete;
+    PipelineCreateLock& operator=(const PipelineCreateLock&) = delete;
+};
 /// Deck, Van Gogh, or under ~13 GiB, unless RX_VK_LOW_MEM=0. off_switch=0 turns this one limit off.
 bool low_mem_on(const char* off_switch);
 

@@ -117,7 +117,8 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
     ci.stage.pName = "main";
     ci.stage.pSpecializationInfo = spec;
     ci.layout = p.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
+    VkResult r;
+    { PipelineCreateLock lock; r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe); }
     vkDestroyShaderModule(dev.device, m, nullptr);
     return r == VK_SUCCESS;
 }
