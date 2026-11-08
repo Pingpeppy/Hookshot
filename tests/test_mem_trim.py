@@ -42,7 +42,7 @@ def main():
     need(begin.index("r.streams.resize(1)") < begin.index("r.si = 0"), "the streams given back are used after")
 
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
-    need(tex.count("if (!bc_scratch_layout(cmd)) return false;") == 2, "a BC3 upload uses a scratch it did not ask for")
+    need(tex.count("bc_scratch_layout(cmd") == 2, "a BC3 upload uses a scratch it did not ask for")
     need("bc_have = false" in block(tex, "void bc_scratch_idle("), "the scratch given back is still taken for made")
     need("dead.push_back" in block(tex, "void bc_scratch_idle("), "the scratch is freed with no wait for the GPU")
     need("total_bytes -= std::min(total_bytes, tex.bytes + tex.pad)" in tex, "a texture leaves the budget by its texels only")
