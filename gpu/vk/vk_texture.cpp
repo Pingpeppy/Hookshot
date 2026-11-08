@@ -3002,6 +3002,23 @@ void texture_frame(uint64_t completed) {
         allowed_eff = std::min(allowed, deck_gpu_cap());
         allowed_eff = std::min(allowed_eff, used + head);
     }
+    // (low-memory: the budget follows the last 8 presents, not the preset and not the 896 MB cap. RX_VK_WS_BUDGET=0: the old number)
+    const bool ws_on = low_mem_on(nullptr) && !(getenv("RX_VK_WS_BUDGET") && getenv("RX_VK_WS_BUDGET")[0] == '0');
+    if (ws_on) {
+        uint64_t recent_b = 0, non_tex = 0;
+        for (auto& kv : textures)
+            if (frame_no - kv.second->last_frame < 8) recent_b += kv.second->bytes;
+        for (int i = 0; i < (int)MemTag::Count; i++) {
+            const MemTag tag = (MemTag)i;
+            if (tag == MemTag::Texture || tag == MemTag::RenderTarget) continue;
+            non_tex += mem_tag_bytes(tag);
+        }
+        const uint64_t ceil_b = allowed_eff > non_tex ? allowed_eff - non_tex : 0;
+        const uint64_t want = recent_b + recent_b / 20 * 3 + (128ull << 20);
+        uint64_t b = want < (1024ull << 20) ? (1024ull << 20) : want;
+        if (b > ceil_b) b = ceil_b;
+        budget = b;
+    }
     if (known && pressure > allowed_eff / 10 * 9) {
         const uint64_t over = pressure - allowed_eff / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
@@ -3160,10 +3177,14 @@ void texture_frame(uint64_t completed) {
     // is not in low-memory mode... both are milliseconds now when MIN_MS is set; otherwise 1000.
     static const uint64_t min_unused_ms =
         getenv("RX_VK_EVICT_MIN_MS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_MS"))) : 1000;
+    static const uint64_t min_presents =
+        getenv("RX_VK_EVICT_MIN_PRESENTS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_PRESENTS"))) : 90;
     const uint64_t unused_ms = press.level >= 2 ? std::min<uint64_t>(min_unused_ms, 250) : min_unused_ms;
     const uint64_t now_ms = tex_now_ms();
     for (auto& [last, tex] : order) {
+        bool overwritten = false;
         if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
+        if (ws_on && frame_no - tex->last_frame < min_presents) break;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3179,7 +3200,6 @@ void texture_frame(uint64_t completed) {
         // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
         // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the
         // driver's paging made submissions of seconds (5-9 fps for a minute)
-        bool overwritten = false;
         if (tex->gpu_written) {
             auto [a, e] = by_gpu.equal_range(tex->gpu);
             for (auto o = a; o != e && !overwritten; ++o)
