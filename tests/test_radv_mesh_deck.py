@@ -34,6 +34,11 @@ def main():
         raise SystemExit("hos_main.c: RX_VK_DECK=0 must turn the profile off")
     if "null image view faults RADV" not in DRAW or "dummies.view[(int)vt]" not in DRAW:
         raise SystemExit("vk_draw.cpp: a view that was not made must be a dummy, not a null handle")
+    if "image view missing and the dummy view was not made" not in DRAW:
+        raise SystemExit("vk_draw.cpp: a draw with no view and no dummy must be skipped before bind")
+    TEX = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
+    if "vkCreateImageView failed" not in TEX:
+        raise SystemExit("vk_texture.cpp: a failed image view must log vkCreateImageView's result")
     print("radv mesh optimizer, payload barrier and deck profile ok")
 
 

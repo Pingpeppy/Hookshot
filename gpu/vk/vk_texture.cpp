@@ -312,14 +312,22 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
                       VkImageUsageFlags usage) {
     if (!usage || (usage & tex->usage) != usage) {
         static int logged;
-        if (logged++ < 8)
-            logf("vk: view format %d type %d wants usage %#x, image format %d has %#x",
-                 (int)f, (int)type, (unsigned)usage, (int)tex->format, (unsigned)tex->usage);
+        if (logged++ < 32)
+            logf("vk: view not created: image format %d view format %d type %d levels %u+%u layers %u+%u "
+                 "wants usage %#x, image has %#x",
+                 (int)tex->format, (int)f, (int)type, level0, nlevels, layer0, nlayers,
+                 (unsigned)usage, (unsigned)tex->usage);
         return VK_NULL_HANDLE;
     }
     // A block-texel view (compressed image, uncompressed format) is one level and one layer.
-    if ((is_bc(tex->format) || is_astc(tex->format)) && !is_bc(f) && !is_astc(f) && (nlevels != 1 || nlayers != 1))
+    if ((is_bc(tex->format) || is_astc(tex->format)) && !is_bc(f) && !is_astc(f) && (nlevels != 1 || nlayers != 1)) {
+        static int logged;
+        if (logged++ < 32)
+            logf("vk: view not created: image format %d view format %d type %d levels %u+%u layers %u+%u "
+                 "is a block view of more than one level or layer",
+                 (int)tex->format, (int)f, (int)type, level0, nlevels, layer0, nlayers);
         return VK_NULL_HANDLE;
+    }
     VkImageViewUsageCreateInfo uci{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     uci.usage = usage & tex->usage;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -333,9 +341,10 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
     const VkResult r = vkCreateImageView(dev.device, &vi, nullptr, &v);
     if (r != VK_SUCCESS) {
         static int logged;
-        if (logged++ < 8)
-            logf("vk: vkCreateImageView format %d (image %d) type %d usage %#x levels %u layers %u -> %d",
-                 (int)f, (int)tex->format, (int)type, (unsigned)uci.usage, nlevels, nlayers, (int)r);
+        if (logged++ < 32)
+            logf("vk: vkCreateImageView failed (%d): image format %d view format %d type %d levels %u+%u "
+                 "layers %u+%u usage %#x",
+                 (int)r, (int)tex->format, (int)f, (int)type, level0, nlevels, layer0, nlayers, (unsigned)uci.usage);
         return VK_NULL_HANDLE;
     }
     return v;

@@ -1478,6 +1478,7 @@ struct DescWriter {
     }
 };
 thread_local DescWriter dw;
+thread_local bool descriptors_valid = true;   // (false only when a missing image view has no dummy either)
 thread_local std::vector<const Texture*> draw_sampled;   // (the textures the descriptors being built sample or store)
 thread_local std::vector<const Texture*> gfx_sampled;    // (the last draw's: kept while its descriptors are reused)
 
@@ -1607,6 +1608,7 @@ bool table_track_open(int logged, int seen, int unlimited) {
 }
 
 void build_descriptors(const NvnState& s, const Program& p) {
+    descriptors_valid = true;
     dw.reset();
     draw_sampled.clear();
     dump_written.clear();
@@ -1922,6 +1924,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled.push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                if (!view) descriptors_valid = false;
                 dw.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
@@ -1957,6 +1960,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written.push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw.imgs.size(), handle, view ? tex : nullptr);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                if (!view) descriptors_valid = false;
                 dw.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
@@ -4366,6 +4370,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         PROF(PROF_DESC);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
+        if (!descriptors_valid) {
+            logf("vk: draw skipped: image view missing and the dummy view was not made (program %016llx)",
+                 (unsigned long long)p.key);
+            SKIP_HERE();
+        }
         static std::string last_logged;
         if (dump_on()) {
             char head[256];
@@ -5530,6 +5539,11 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     dclock.t_pipe = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     end_pass(cmd);
     build_descriptors(s, p);
+    if (!descriptors_valid) {
+        logf("vk: dispatch skipped: image view missing and the dummy view was not made (program %016llx)",
+             (unsigned long long)p.key);
+        SKIP_HERE();
+    }
     dclock.t_desc = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (dump_on())
         logf("vk: dump-in %03d dispatch %ux%ux%u prog %016llx:%s", dump_seq(), x, y, z, (unsigned long long)p.key,
