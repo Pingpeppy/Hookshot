@@ -1685,7 +1685,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.imageGranularity.width, x.sparse_req.formatProperties.imageGranularity.height,
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
-    } else if (!create_image(ci, x.image, x.allocation, false, depth ? MemTag::RenderTarget : MemTag::Texture)) {
+    } else if (!create_image(ci, x.image, x.allocation, false,
+                            (depth || (x.levels == 1 && x.type == VK_IMAGE_TYPE_2D && !x.astc && !x.bc &&
+                                       (x.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
+                                ? MemTag::RenderTarget : MemTag::Texture)) {
         static int logged;
         if (logged++ < 16)
             logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,

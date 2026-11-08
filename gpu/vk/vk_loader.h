@@ -87,6 +87,7 @@
     X(vkBindImageMemory)                                                                                              \
     X(vkGetBufferMemoryRequirements)                                                                                  \
     X(vkGetImageMemoryRequirements)                                                                                   \
+    X(vkGetDeviceImageMemoryRequirements)                                                                             \
     X(vkGetImageSparseMemoryRequirements)                                                                             \
     X(vkGetMemoryHostPointerPropertiesEXT)                                                                            \
     X(vkGetMemoryFdPropertiesKHR)                                                                                     \

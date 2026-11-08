@@ -90,16 +90,45 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
 // for render targets, and anything over half a default block), a vkAllocateMemory and a kernel call for each, and
 // the dynamic resolution makes a new set of render targets every few frames. Images too large for a block, or of a
 // memory type the pool's is not, are allocated as before.
-VmaPool image_pool = VK_NULL_HANDLE;
-bool image_pool_tried = false;
-// (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up: the block's size. VMA keeps one block empty for the next image, 128 MB of VRAM that a 64 MB block
-// would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
-const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
-
-VmaPool images_pool() {
-    if (image_pool_tried) return image_pool;
-    image_pool_tried = true;
-    VkImageCreateInfo rep{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (a representative image: the pool's memory type)
+VmaPool image_pool = VK_NULL_HANDLE, rt_pool = VK_NULL_HANDLE;
+bool image_pool_tried = false, rt_pool_tried = false;
+// (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up. RADV in low-memory mode uses 32 MB: amdgpu does not have NVIDIA's ~4096
+// allocation cap, and 128 MB blocks kept a gigabyte free inside them. Everyone else stays at 128 MB)
+uint64_t image_block_bytes() {
+    static uint64_t v = 0;
+    if (!v) {
+        if (const char* e = getenv("RX_VK_IMAGE_BLOCK_MB")) v = (uint64_t)std::max(16, atoi(e)) << 20;
+        else if (radv_driver() && low_mem_on(nullptr)) v = 32ull << 20;
+        else v = 128ull << 20;
+    }
+    return v;
+}
+// (RX_VK_DEDICATED_MB=<n>: images at least this big get their own memory object. 0: never. Unset, on RADV in
+// low-memory mode: half a block, so freeing one gives the memory back whole)
+uint64_t dedicated_floor() {
+    if (const char* e = getenv("RX_VK_DEDICATED_MB")) {
+        if (!e[0] || (e[0] == '0' && e[1] == 0)) return ~0ull;
+        return (uint64_t)std::max(1, atoi(e)) << 20;
+    }
+    if (!(radv_driver() && low_mem_on(nullptr))) return ~0ull;
+    return image_block_bytes() / 2;
+}
+bool rt_pool_on() {
+    if (const char* e = getenv("RX_VK_RT_POOL")) return e[0] != '0';
+    return radv_driver() && low_mem_on(nullptr);
+}
+uint64_t image_requirement_bytes(const VkImageCreateInfo& ci) {
+    if (!vkGetDeviceImageMemoryRequirements) return 0;
+    VkDeviceImageMemoryRequirements req{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+    req.pCreateInfo = &ci;
+    VkMemoryRequirements2 mr{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    vkGetDeviceImageMemoryRequirements(dev.device, &req, &mr);
+    return mr.memoryRequirements.size;
+}
+VmaPool make_pool(VmaPool* slot, bool* tried, const char* what) {
+    if (*tried) return *slot;
+    *tried = true;
+    VkImageCreateInfo rep{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     rep.imageType = VK_IMAGE_TYPE_2D;
     rep.format = VK_FORMAT_R8G8B8A8_UNORM;
     rep.extent = {256, 256, 1};
@@ -113,12 +142,14 @@ VmaPool images_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
-    pi.blockSize = kImageBlock;
-    if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
-    logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(kImageBlock >> 20), type,
-         image_pool ? "" : ": not made");
-    return image_pool;
+    pi.blockSize = image_block_bytes();
+    if (vmaCreatePool(vma, &pi, slot) != VK_SUCCESS) *slot = VK_NULL_HANDLE;
+    logf("vk: %s from a pool of %llu MB blocks (memory type %u)%s", what, (unsigned long long)(image_block_bytes() >> 20), type,
+         *slot ? "" : ": not made");
+    return *slot;
 }
+VmaPool images_pool() { return make_pool(&image_pool, &image_pool_tried, "images"); }
+VmaPool render_target_pool() { return make_pool(&rt_pool, &rt_pool_tried, "render targets"); }
 
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, MemTag tag) {
     VmaAllocationCreateInfo ai{};
@@ -127,13 +158,21 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     // and takes the RAM the game and everything else on the machine need)
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    if (!dedicated) {
+        const uint64_t floor = dedicated_floor();
+        if (floor != ~0ull) {
+            const uint64_t need = image_requirement_bytes(ci);
+            if (need >= floor) dedicated = true;
+        }
+    }
     if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
         VmaAllocationCreateInfo dai = ai;
         dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return mem_tag_add(allocation, tag), true;
     }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
-    if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
+    const bool use_rt = tag == MemTag::RenderTarget && rt_pool_on();
+    if (VmaPool pool = no_pool ? VK_NULL_HANDLE : (use_rt ? render_target_pool() : images_pool())) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
