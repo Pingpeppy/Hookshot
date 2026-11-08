@@ -7,11 +7,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __linux__
 #include <dirent.h>
 #include <dlfcn.h>
 #include <malloc.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace mkwvk {
 
@@ -58,6 +60,9 @@ void amdgpu_totals(uint64_t* vram_used, uint64_t* vram_total, uint64_t* gtt_used
 }
 void proc_fd_mem(uint64_t* memfd, uint64_t* proc_vram, uint64_t* proc_gtt) {
     *memfd = *proc_vram = *proc_gtt = 0;
+#ifndef __linux__
+    return;
+#else
     DIR* d = opendir("/proc/self/fd");
     if (!d) return;
     char link[256], path[64];
@@ -82,6 +87,7 @@ void proc_fd_mem(uint64_t* memfd, uint64_t* proc_vram, uint64_t* proc_gtt) {
         }
     }
     closedir(d);
+#endif
 }
 uint64_t mb(uint64_t b) { return b >> 20; }
 } // namespace
@@ -126,7 +132,9 @@ void deck_memlog_emit(DeckMemSnap snap) {
         const uint64_t streams = mem_tag_bytes(MemTag::Stream);
         const uint64_t bc = mem_tag_bytes(MemTag::BcScratch);
         uint64_t recordings = 0;
+#ifdef __linux__
         if (auto* fn = (uint64_t (*)())dlsym(RTLD_DEFAULT, "rx_nvn_copy_bytes")) recordings = fn();
+#endif
         logf("vk: memlog t=%.1fs present=%llu sys: avail=%llu free=%llu swap_used=%llu | proc: rss=%llu anon=%llu shmem=%llu "
              "file=%llu swap=%llu | guest: memfd=%llu imported=%llu | amdgpu: vram=%llu/%llu gtt=%llu/%llu proc_vram=%llu proc_gtt=%llu",
              snap.seconds, (unsigned long long)snap.present, (unsigned long long)mb(avail), (unsigned long long)mb(free),
