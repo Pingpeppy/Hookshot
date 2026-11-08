@@ -20,7 +20,7 @@ std::atomic<int> pending{0};
 bool started = false;
 
 void worker() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    SetThreadPriority(GetCurrentThread(), low_mem_on("RX_VK_LOW_COMPILE") ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
     for (;;) {
         std::function<void()> fn;
@@ -37,13 +37,23 @@ void worker() {
 }
 
 void start() {
-    const unsigned n = std::clamp(std::thread::hardware_concurrency() / 3, 2u, 4u);
+    unsigned n = std::clamp(std::thread::hardware_concurrency() / 3, 2u, 4u);
+    // One worker on a 4-core Deck. Two at below-normal were each at 95% while the game waited on memory.
+    if (low_mem_on("RX_VK_LOW_COMPILE")) n = 1;
     for (unsigned i = 0; i < n; i++) std::thread(worker).detach();
     started = true;
-    logf("vk: %u background workers (shader translation, pipelines)", n);
+    if (n == 1)
+        logf("vk: 1 background worker (shader translation, pipelines) at idle priority. RX_VK_LOW_COMPILE=0 uses the usual count");
+    else
+        logf("vk: %u background workers (shader translation, pipelines)", n);
 }
 
 } // namespace
+
+void jobs_start() {
+    std::lock_guard lk(mu);
+    if (!started) start();
+}
 
 void jobs_push(std::function<void()> fn, bool urgent) {
     std::lock_guard lk(mu);

@@ -8,6 +8,8 @@
 
 namespace mkwvk {
 
+/// Starts the gameplay workers once. Low memory is one idle thread. Logged as "1 background worker" in that case.
+void jobs_start();
 /// Queues fn for a worker (urgent: ahead of the others, for work a draw waits on)
 void jobs_push(std::function<void()> fn, bool urgent = false);
 /// Queues fn for the one thread that runs such jobs one at a time, in order

@@ -1080,14 +1080,22 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             vkGetPhysicalDeviceProperties(dev.physical, &pr);
             return pr.vendorID == 0x1002;
         }();
-        static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
-        if (amd && !mesh_opt) {
+        // RADV on Van Gogh hangs the gfx ring when these are built without the optimizer. The proprietary AMD
+        // compiler is the one that crashes or takes minutes with it (RX_VK_MESH_OPT=1 keeps it there).
+        // RX_VK_MESH_OPT=0 builds RADV's without it, as the proprietary path does.
+        static const bool radv = radv_driver();
+        const char* mo = getenv("RX_VK_MESH_OPT");
+        const bool force_on = mo && mo[0] != '0';
+        const bool force_off = mo && mo[0] == '0';
+        if ((amd && !radv && !force_on) || (radv && force_off)) {
             bool mesh = false;
             for (const Stage& st : p.stages) mesh |= (st.vk_stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
             if (mesh) {
                 ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 static std::atomic<int> told{0};
-                if (told++ < 1) logf("vk: task and mesh programs built without the driver's optimizer (AMD; RX_VK_MESH_OPT=1: with it)");
+                if (told++ < 1)
+                    logf("vk: task and mesh programs built without the driver's optimizer (%s; RX_VK_MESH_OPT=%s)",
+                         radv ? "RADV, asked" : "AMD", radv ? "0 turns this on" : "1 keeps the optimizer");
             }
         }
     }
@@ -5124,7 +5132,28 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    unsigned nprep = std::clamp(cpus / 2, 1u, 32u);
+    if (const char* e = getenv("RX_VK_PRECOMPILE_THREADS")) {
+        const int v = atoi(e);
+        if (v > 0) nprep = (unsigned)std::min(v, 32);
+    } else if (low_mem_on("RX_VK_LOW_COMPILE")) {
+        nprep = std::min(nprep, 6u);
+    }
+#ifndef _WIN32
+    if (low_mem_on("RX_VK_PRECOMPILE_FREE")) {
+        unsigned long long free_kb = 0;
+        if (FILE* mf = fopen("/proc/meminfo", "r")) {
+            char line[128];
+            while (fgets(line, sizeof line, mf))
+                if (sscanf(line, "MemAvailable: %llu", &free_kb) == 1) break;
+            fclose(mf);
+        }
+        const unsigned long long floor_mb = getenv("RX_VK_PRECOMPILE_FREE_MB") ? (unsigned long long)atoi(getenv("RX_VK_PRECOMPILE_FREE_MB")) : 2048ull;
+        if (free_kb && free_kb / 1024 < floor_mb) nprep = 1;
+    }
+#endif
+    logf("vk: shader prep on %u thread%s (RX_VK_PRECOMPILE_THREADS, RX_VK_PRECOMPILE_FREE_MB)", nprep, nprep == 1 ? "" : "s");
+    for (unsigned i = 0; i < nprep; i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -5224,7 +5253,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
+    unsigned npre = std::min(cpus, 64u);
+    if (low_mem_on("RX_VK_LOW_COMPILE")) npre = std::min(npre, 6u);
+    for (unsigned i = 0; i < npre; i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);

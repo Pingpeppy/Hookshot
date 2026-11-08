@@ -16,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -315,6 +316,8 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     si.signalSemaphoreInfoCount = nsig;
     si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
+    uint64_t wait_first = 0;
+    {
     std::lock_guard lk(dev.present_mu);   // (one queue: submits and presents take turns)
     if (batch_on()) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
@@ -325,15 +328,37 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         r.submitted = true;
         // (RX_VK_BATCH_MAX=<command buffers>: held at most this many, default 32)
         static const size_t cap = getenv("RX_VK_BATCH_MAX") ? (size_t)std::max(1, atoi(getenv("RX_VK_BATCH_MAX"))) : 32;
-        if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
-        return;
-    }
+        // The first submit used to stay on the CPU until a later flush. The game then read the buffer the GPU was
+        // supposed to have filled, and sead::MainThread faulted on a null (Deck run of baf6f1f, the first
+        // QueueSubmitCommands, x1 holding tag bytes from that buffer). It is sent and waited for. Later submits stay
+        // batched. RX_VK_BATCH_HOLD_FIRST=1 holds the first one too. RX_VK_BATCH=0 sends every submit on its own.
+        static int batched_n = 0;
+        const bool first = batched_n++ == 0;
+        static const bool hold_first = getenv("RX_VK_BATCH_HOLD_FIRST") && atoi(getenv("RX_VK_BATCH_HOLD_FIRST")) != 0;
+        if (pend.cbs.size() >= cap || (first && !hold_first)) {
+            flush_reason = pend.cbs.size() >= cap ? FR_CAP : FR_OTHER;
+            if (first && !hold_first)
+                logf("vk: the first submit is sent now and waited for. RX_VK_BATCH_HOLD_FIRST=1 holds it with the later ones");
+            queue_flush_locked();
+            if (first && !hold_first && signal_value) wait_first = signal.value;
+        }
+    } else {
     PROF(PROF_QSUBMIT);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     r.submitted = res == VK_SUCCESS;
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+    }
+    }
+    if (wait_first) {
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &timeline;
+        wi.pValues = &wait_first;
+        if (vkWaitSemaphores(dev.device, &wi, 2000000000ull) == VK_TIMEOUT)
+            logf("vk: the first submit was still running after 2 s (timeline %llu)", (unsigned long long)wait_first);
+    }
 }
 
 // ---- NVN state (the draw path's, vk_state.h) ----
@@ -2746,10 +2771,23 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         log_frame_stats();
     }
     if (dev.offscreen || interpolated) return;
+    pace_fps_cap();
     present_image(src, sw, sh, crop, direct_view);
 }
 
 } // namespace
+
+void pace_fps_cap() {
+    static const int cap = getenv("RX_VK_FPS_CAP") ? std::atoi(getenv("RX_VK_FPS_CAP")) : 0;
+    if (cap < 15 || cap > 240) return;
+    using clock = std::chrono::steady_clock;
+    static clock::time_point next{};
+    const auto step = std::chrono::nanoseconds(1000000000LL / cap);
+    const auto now = clock::now();
+    if (next.time_since_epoch().count() != 0 && now < next) std::this_thread::sleep_until(next);
+    const auto after = clock::now();
+    next = (next.time_since_epoch().count() == 0 || after > next + step) ? after + step : next + step;
+}
 
 // (hookshot) RX_VK_FRAMELOG=<file>: every frame shown, the game's and the made ones, as they go to the screen, 320x180, while
 // <file>.go exists (scripts/framelog.py finds the flashes). Taken at the last step and written on a thread of its own, so

@@ -6,6 +6,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -15,6 +16,7 @@
 #include "vk_api.h"
 #include "vk_draw.h"
 #include "vk_internal.h"
+#include "vk_jobs.h"
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -172,6 +174,12 @@ bool create_device() {
     };
     optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
     optional(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, dev.external_memory_host);
+    {
+        bool fd = false, dma = false;
+        optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, fd);
+        optional(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, dma);
+        dev.dma_buf_import = fd && dma;
+    }
     optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, dev.pipeline_library);
     if (dev.pipeline_library) optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, dev.graphics_pipeline_library);
     optional(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, dev.custom_border_color);
@@ -305,7 +313,8 @@ bool create_device() {
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
-    dev.sparse_images = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding &&
+    dev.sparse_binding = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
+    dev.sparse_images = dev.sparse_binding &&
                         f.features.sparseResidencyImage2D && !(getenv("RX_VK_SPARSE") && !atoi(getenv("RX_VK_SPARSE")));
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
@@ -408,6 +417,21 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 namespace {
 
 HWND main_window = nullptr;
+#ifndef _WIN32
+const MkwVkWindow* prep_window = nullptr;
+#endif
+void prep_title(size_t done, size_t total, const char* what) {
+#ifndef _WIN32
+    if (!prep_window || prep_window->version < 2 || !prep_window->set_title || !total) return;
+    char title[96];
+    snprintf(title, sizeof title, "Hookshot — %s %zu%%", what, done * 100 / total);
+    prep_window->set_title(prep_window->window, title);
+#else
+    (void)done;
+    (void)total;
+    (void)what;
+#endif
+}
 // (hookshot) hookshot --prepare-shaders (a builder, after a build): the same work with no game, its progress as
 // "@@progress" lines on stdout. A skip there leaves hookshot_prepare_skipped beside the game: its own starts then
 // leave the work out too (what was not prepared is built when first drawn), until a --prepare-shaders run ends it
@@ -472,6 +496,7 @@ bool started_up() {
                     if (console == INVALID_HANDLE_VALUE) console = nullptr;
                 }
             }
+            prep_title(done, total, "preparing shaders before the game");
             if (!console) return;
             char line[80];
             const int n = snprintf(line, sizeof line, "%cPreparing shaders: %zu of %zu (%zu%%)   ", 13, done, total, done * 100 / total);
@@ -481,7 +506,13 @@ bool started_up() {
         prepare_run(progress);
         precompile_run(progress);
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
+        prep_title(1, 1, "Hookshot");
+#ifndef _WIN32
+        if (prep_window && prep_window->version >= 2 && prep_window->set_title)
+            prep_window->set_title(prep_window->window, "Hookshot");
+#endif
     }
+    jobs_start();
     return true;
 }
 int start(void* hwnd) {
@@ -517,6 +548,7 @@ int start(void* hwnd) {
         return 0;
     }
     int width = 0, height = 0;
+    prep_window = w;
     w->drawable_size(w->window, &width, &height);
     if (!create_swapchain((uint32_t)width, (uint32_t)height)) return 0;
 #endif
@@ -556,10 +588,31 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    std::set_new_handler([] {
+        logf("vk: C++ allocation failed. This is an out-of-memory failure, not \"window closed\" and not a GPU reset.");
+        std::abort();
+    });
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
+    if (radv_driver()) {
+        const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH");
+        logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
+             vangogh ? " on Van Gogh" : "");
+        if (vangogh && !getenv("RX_VK_DECK")) {
+#ifndef _WIN32
+            setenv("RX_VK_DECK", "1", 0);
+            if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
+            if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
+#endif
+            logf("vk: Steam Deck profile (Van Gogh): frame generation off, present cap 45 fps. "
+                 "RX_VK_DECK=0 leaves the Insert menu as it is");
+        }
+    }
+    if (low_mem_on(nullptr))
+        logf("vk: low-memory mode (Deck or under ~13 GiB). Texture budget and staging are tightened. "
+             "RX_VK_LOW_TEX=0, RX_VK_LOW_STAGING=0 and RX_VK_LOW_COMPILE=0 turn those off. RX_VK_LOW_MEM=0 turns them all off.");
     if (!dev.mesh_shader && !dev.mesh_fallback && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
         // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on.)
@@ -585,4 +638,44 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 
 namespace mkwvk {
 HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
+
+bool radv_driver() {
+    static const int id = [] {
+        if (!dev.physical) return 0;
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        return (int)dp.driverID;
+    }();
+    return id == VK_DRIVER_ID_MESA_RADV;
+}
+
+bool radv_mesh_payload_barrier() {
+    const char* e = getenv("RX_VK_MESH_PAYLOAD_BARRIER");
+    if (e && e[0]) return std::atoi(e) != 0;
+    return radv_driver();
+}
+
+bool low_mem_on(const char* off_switch) {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_LOW_MEM");
+        if (e && e[0]) return std::atoi(e) != 0 ? 1 : 0;
+        if (const char* d = getenv("RX_VK_DECK"); d && d[0] != '0') return 1;
+#ifndef _WIN32
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char line[128];
+            unsigned long long kb = 0;
+            while (fgets(line, sizeof line, f))
+                if (sscanf(line, "MemTotal: %llu", &kb) == 1) break;
+            fclose(f);
+            if (kb && kb < 13ull * 1024 * 1024) return 1;
+        }
+#endif
+        return 0;
+    }();
+    if (!mode) return false;
+    const char* e = off_switch ? getenv(off_switch) : nullptr;
+    return !(e && e[0] == '0');
+}
 } // namespace mkwvk

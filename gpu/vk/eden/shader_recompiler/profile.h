@@ -114,6 +114,10 @@ struct Profile {
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
 
+    /// Task-payload stores use Output memory semantics, so the mesh workgroups a task emits see one count.
+    /// RADV hangs the gfx ring without it. Other drivers, and mesh-stage barriers, keep workgroup memory only.
+    bool mesh_payload_output_memory{};
+
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
     }

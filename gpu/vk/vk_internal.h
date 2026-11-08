@@ -28,6 +28,11 @@ extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
+void pace_fps_cap();         // (RX_VK_FPS_CAP, before a present)
+bool radv_driver();
+bool radv_mesh_payload_barrier();
+/// Deck, Van Gogh, or under ~13 GiB, unless RX_VK_LOW_MEM=0. off_switch=0 turns this one limit off.
+bool low_mem_on(const char* off_switch);
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
@@ -39,7 +44,8 @@ struct Device {
     uint32_t queue_family = 0;
     VkQueue queue = VK_NULL_HANDLE;
     // extensions in use
-    bool mesh_shader = false, external_memory_host = false, pipeline_library = false,
+    bool mesh_shader = false, external_memory_host = false, dma_buf_import = false, sparse_binding = false,
+         pipeline_library = false,
          graphics_pipeline_library = false, custom_border_color = false, dynamic_state3 = false,
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
          conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,

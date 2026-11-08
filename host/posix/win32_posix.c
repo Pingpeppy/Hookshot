@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <linux/futex.h>
 #include <signal.h>
+#include <unistd.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -628,6 +629,12 @@ static int prot_of(DWORD p) {
     default: return PROT_READ | PROT_WRITE;
     }
 }
+/* Guest pages given back so they read as zero. The executable's hos_main.c replaces this when the window is a
+   memfd (MADV_REMOVE punches the hole; MADV_DONTNEED does not, on a shared mapping). The weak copy is what
+   hookshot_vk.so keeps: that copy does not own the window. */
+__attribute__((weak)) int hos_posix_guest_discard(void *p, size_t n) {
+    return madvise(p, n, MADV_DONTNEED);
+}
 /* the reservations VirtualAlloc made, for MEM_RELEASE (which gives no size) */
 static struct { uintptr_t base; size_t size; } regions[256];
 static pthread_mutex_t regions_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -635,7 +642,7 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
     const uintptr_t page = 4096;
     if (type & MEM_RESET) {   /* (the contents are not wanted any more: they read as zero after this) */
         const uintptr_t lo = ((uintptr_t)addr + page - 1) & ~(page - 1), hi = ((uintptr_t)addr + size) & ~(page - 1);
-        if (hi > lo) madvise((void *)lo, hi - lo, MADV_DONTNEED);
+        if (hi > lo) hos_posix_guest_discard((void *)lo, hi - lo);
         return addr;
     }
     if (addr && (type & MEM_COMMIT) && !(type & MEM_RESERVE)) {
@@ -661,7 +668,7 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
 BOOL VirtualFree(void *addr, SIZE_T size, DWORD type) {
     if (type & MEM_DECOMMIT) {   /* (kept mapped: decommitted memory reads as zero when touched again) */
         const uintptr_t lo = (uintptr_t)addr & ~(uintptr_t)4095, hi = ((uintptr_t)addr + size + 4095) & ~(uintptr_t)4095;
-        return madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0 ? TRUE : fail_errno();
+        return hos_posix_guest_discard((void *)lo, hi - lo) == 0 ? TRUE : fail_errno();
     }
     if (type & MEM_RELEASE) {
         pthread_mutex_lock(&regions_mu);
@@ -1120,7 +1127,9 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
         p->sa_handler(sig);
         return;
     }
-    signal(sig, SIG_DFL);
+    /* The default action writes a core. The guest window is a 512 GB reservation, so that dump never finishes
+       and the window stays on the last frame (the shader prep screen sat at 99%). Leave without one. */
+    _exit(128 + sig);
 }
 static void install_signals(void) {
     static int done;

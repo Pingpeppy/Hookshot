@@ -12,6 +12,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
+#include <unistd.h>
 #endif
 #include <io.h>
 #include <algorithm>
@@ -465,6 +466,7 @@ Shader::Profile make_profile() {
     p.need_declared_frag_colors = false;
     p.max_subgroup_size = 32;
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.mesh_payload_output_memory = radv_mesh_payload_barrier();
     return p;
 }
 
@@ -823,9 +825,21 @@ uint64_t disk_stamp() {
 #endif
     };
     add(abi, sizeof abi);
-    for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "EDEN_"})
-            if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
+    // Exact names that change the SPIR-V. Deck, low-memory, and RX_VK_MESH_OPT (a pipeline flag, not a translation)
+    // are not here, so a Deck build is not translated again just because the profile turned those on.
+    static const char* spirv_env[] = {
+        "RX_VK_TASK_CAP", "RX_VK_MESH_NO_ZERO", "RX_VK_MESH_FIRST", "RX_VK_MESH_PAYLOAD_BARRIER",
+        "RX_VK_NO_FOLLOW", "RX_VK_FOLLOW_STORES", "RX_VK_FOLLOW_MESH", "RX_VK_FOLLOW_GRAPHICS",
+        "RX_VK_NO_F16", "RX_VK_OOT_VISUAL", "RX_VK_OOT_FOG", "RX_VK_OOT_EXPOSURE",
+        "RX_VK_NATIVE_MMA_KEYS", "EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_TENSOR",
+    };
+    for (const char* name : spirv_env) {
+        const char* v = getenv(name);
+        if (!v) continue;
+        add(name, strlen(name));
+        add("=", 1);
+        add(v, strlen(v));
+    }
     return h;
 }
 
@@ -866,6 +880,9 @@ void disk_init() {
             uint32_t head[2]{};
             uint64_t kept = 0;
             if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == kDiskMagic && kept == stamp) {
+#ifndef _WIN32
+                posix_fadvise(fileno(f), 0, 0, POSIX_FADV_RANDOM);
+#endif
                 good = 16;
                 while (good + 20 <= whole) {
                     uint64_t rec[2];
@@ -874,9 +891,15 @@ void disk_init() {
                     if (fread(rec, 8, 2, f) != 2 || fread(&kind, 4, 1, f) != 1) break;
                     if (good + 16 + (int64_t)rec[1] > whole) break;   // (the run stopped while writing it)
                     disk_records[rec[0]].push_back({good + 16, (size_t)rec[1], kind});
+#ifndef _WIN32
+                    if (rec[1] > (64u << 10)) posix_fadvise(fileno(f), good + 16, (off_t)rec[1], POSIX_FADV_DONTNEED);
+#endif
                     good += 16 + (int64_t)rec[1];
                 }
             }
+#ifndef _WIN32
+            posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
             fclose(f);
         }
         if (good) {
@@ -885,6 +908,14 @@ void disk_init() {
             }
             disk_out = fopen(path.c_str(), "ab");
         } else {
+            if (whole > 16) {
+                logf("vk: program cache stamp differs (%lld MB on disk): started empty. The old file is renamed aside. "
+                     "The stamp is the translator and the SPIR-V switches only, so Deck and low-memory settings do not "
+                     "make it start again.",
+                     (long long)(whole >> 20));
+                ::remove((path + ".rejected").c_str());
+                ::rename(path.c_str(), (path + ".rejected").c_str());
+            }
             disk_out = fopen(path.c_str(), "wb");
             if (disk_out) {
                 const uint32_t h[2] = {kDiskMagic, 0};
@@ -895,7 +926,12 @@ void disk_init() {
         }
         disk_in = disk_out ? fopen(path.c_str(), "rb") : nullptr;
         disk_on = disk_out != nullptr && disk_in != nullptr;
-        logf("vk: program cache %s: %zu program keys kept, %lld KB", path.c_str(), disk_records.size(), (long long)(good >> 10));
+#ifndef _WIN32
+        if (disk_out) posix_fadvise(fileno(disk_out), 0, 0, POSIX_FADV_DONTNEED);
+        if (disk_in) posix_fadvise(fileno(disk_in), 0, 0, POSIX_FADV_DONTNEED);
+#endif
+        logf("vk: program cache %s: %zu program keys kept, %lld MB on disk, index only (payloads are not resident)",
+             path.c_str(), disk_records.size(), (long long)(good >> 20));
     });
 }
 

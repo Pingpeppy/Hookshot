@@ -47,8 +47,39 @@ void hos_mem_init(uint64_t image_end) {
     hos_log("memory: %llu MB for the game (window %llu MB)", (unsigned long long)(hos_total_memory >> 20),
             (unsigned long long)(HOS_SPACE_END >> 20));
 #else
-    /* mkw-recomp: a Switch 2 application gets 9809 MB (Eglantine's KSystemControl, 12 GB arrangement) */
-    hos_total_memory = (mb ? strtoull(mb, NULL, 0) : 9809ULL) << 20;
+    /* mkw-recomp: a Switch 2 application gets 9809 MB (Eglantine's KSystemControl, 12 GB arrangement).
+       The Deck has 11.7 GB shared with the GPU. Telling the game it has 9809 MB made it commit about 8 GB
+       by the first outdoor load, and earlyoom sent SIGTERM. 4608 MB is what it is told on a Deck or under
+       ~13 GiB, unless HOS_MEMORY_MB is set or RX_VK_LOW_HEAP=0. */
+    unsigned long long total_mb = 9809ULL;
+    if (!mb) {
+        int small = 0;
+        const char *heap = getenv("RX_VK_LOW_HEAP");
+        const char *deck = getenv("RX_VK_DECK");
+        const char *low = getenv("RX_VK_LOW_MEM");
+        if (heap && heap[0] == '0') small = 0;
+        else if (low && low[0] == '0') small = 0;
+        else if (deck && deck[0] != '0') small = 1;
+        else if (low && atoi(low) != 0) small = 1;
+#ifndef _WIN32
+        else {
+            FILE *mf = fopen("/proc/meminfo", "r");
+            if (mf) {
+                char line[128];
+                unsigned long long kb = 0;
+                while (fgets(line, sizeof line, mf))
+                    if (sscanf(line, "MemTotal: %llu", &kb) == 1) break;
+                fclose(mf);
+                if (kb && kb < 13ull * 1024 * 1024) small = 1;
+            }
+        }
+#endif
+        if (small) total_mb = 4608ULL;
+    }
+    hos_total_memory = (mb ? strtoull(mb, NULL, 0) : total_mb) << 20;
+    if (!mb && total_mb != 9809ULL)
+        hos_log("memory: game is told it has %llu MB (Switch 2 default is 9809). HOS_MEMORY_MB overrides. "
+                "RX_VK_LOW_HEAP=0 keeps 9809.", (unsigned long long)(hos_total_memory >> 20));
 #endif
 }
 
