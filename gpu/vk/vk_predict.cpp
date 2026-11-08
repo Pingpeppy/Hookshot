@@ -93,7 +93,10 @@ std::vector<Class> candidates(const Seen* exact, const Seen* sig) {
 
 std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::unique_ptr<PipeNote>>& notes, size_t* programs) {
     std::unordered_map<std::pair<uint64_t, uint64_t>, Face, PairHash> faces;
+    size_t read_n = 0;
     program_cache_each([&](const KeptProgram& k) {
+        ++read_n;
+        if (read_n == 1 || read_n % 2048 == 0) logf("vk: prediction read %zu programs from the cache", read_n);
         Face f;
         for (const auto& [stage, spirv] : k.stages) {
             const uint64_t h = fnv(spirv.data(), spirv.size() * 4);

@@ -118,7 +118,8 @@ bool no_a2c() {   // (RX_VK_NO_A2C, read once: it was a getenv on every alpha-to
 
 /// 32 lanes, where the stage can be held to it (workgroup_x: a compute stage's width, which full subgroups must divide)
 void pin_subgroup(VkPipelineShaderStageCreateInfo& st, uint32_t workgroup_x = 0) {
-    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = [] {
+    // (one per thread: every stage's pNext pointed at one static, and two pipeline creates handed RADV the same chain)
+    thread_local const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = [] {
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo r{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         r.requiredSubgroupSize = 32;
         return r;
@@ -5808,6 +5809,15 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     return typed_upscale(cmd, dw.imgs[0].imageView, dw.imgs[ntex].imageView, out, level, p.key, keys, true);
 }
 
+/// RX_VK_PRECOMPILE_THREADS, when set, is the thread count for prep, prediction and the precompile. Unset: fallback.
+unsigned startup_driver_threads(unsigned fallback) {
+    if (const char* e = getenv("RX_VK_PRECOMPILE_THREADS")) {
+        const int v = atoi(e);
+        if (v > 0) return (unsigned)std::min(v, 32);
+    }
+    return std::max(1u, fallback);
+}
+
 bool precompile_wanted() {
 #if defined(HOOKSHOT_RELEASE)
     bool on = true;
@@ -5922,13 +5932,8 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    unsigned nprep = std::clamp(cpus / 2, 1u, 32u);
-    if (const char* e = getenv("RX_VK_PRECOMPILE_THREADS")) {
-        const int v = atoi(e);
-        if (v > 0) nprep = (unsigned)std::min(v, 32);
-    } else if (low_mem_on("RX_VK_LOW_COMPILE")) {
-        nprep = std::min(nprep, 6u);
-    }
+    unsigned nprep = startup_driver_threads(std::clamp(cpus / 2, 1u, 32u));
+    if (!getenv("RX_VK_PRECOMPILE_THREADS") && low_mem_on("RX_VK_LOW_COMPILE")) nprep = std::min(nprep, 6u);
 #ifndef _WIN32
     if (low_mem_on("RX_VK_PRECOMPILE_FREE")) {
         unsigned long long free_kb = 0;
@@ -5953,8 +5958,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     int64_t translated = 0, failed = 0;
     shader_stats(&translated, &failed);
-    logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries; %zu compute variants, %zu programs with "
-         "texture variants, %zu at the limit) in %.1f s", programs, made.load(), (long long)failed, libs.load(), variants.load(),
+    logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries%s; %zu compute variants, %zu programs with "
+         "texture variants, %zu at the limit) in %.1f s", programs, made.load(), (long long)failed, libs.load(),
+         (!warm && !warm_cs) ? ", driver warm left out" : "", variants.load(),
          asking.load(), capped.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     remove(warming.c_str());
     if (FILE* f = fopen(path.c_str(), "wb")) fwrite(&stamp, 8, 1, f), fclose(f);
@@ -6054,8 +6060,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    unsigned npre = std::min(cpus, 64u);
-    if (low_mem_on("RX_VK_LOW_COMPILE")) npre = std::min(npre, 6u);
+    unsigned npre = startup_driver_threads(std::min(cpus, 64u));
+    if (!getenv("RX_VK_PRECOMPILE_THREADS") && low_mem_on("RX_VK_LOW_COMPILE")) npre = std::min(npre, 6u);
+    logf("vk: precompile on %u thread%s", npre, npre == 1 ? "" : "s");
     for (unsigned i = 0; i < npre; i++) threads.emplace_back(worker);
     static const int stall_s = getenv("RX_VK_PRECOMPILE_STALL_S") ? atoi(getenv("RX_VK_PRECOMPILE_STALL_S")) : 30;
     size_t last_done = 0;
@@ -6093,6 +6100,9 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
+    // (this is the quiet stretch after prep: the cache is read whole before any pipeline is built, and the workers are
+    // RX_VK_PRECOMPILE_THREADS when that is set, otherwise half the CPUs. Run 9 skipped it, its cache stamp already matched)
+    logf("vk: predicting pipelines from %zu notes (reading the program cache first)", notes.size());
     size_t programs = 0;
     const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs);
     std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
@@ -6122,9 +6132,18 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    const unsigned npred = startup_driver_threads(std::clamp(cpus / 2, 1u, 32u));
+    logf("vk: prediction: %zu pipelines for %zu program variants, on %u thread%s", predicted.size(), programs, npred,
+         npred == 1 ? "" : "s");
+    for (unsigned i = 0; i < npred; i++) threads.emplace_back(worker);
+    auto last_log = std::chrono::steady_clock::now();
     while (next.load() < keys.size() + threads.size()) {
         if (progress) progress(done.load(), predicted.size());
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log >= std::chrono::seconds(2)) {
+            logf("vk: predicting: %zu of %zu pipelines", done.load(), predicted.size());
+            last_log = now;
+        }
         Sleep(100);
     }
     for (std::thread& t : threads) t.join();

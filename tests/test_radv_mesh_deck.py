@@ -46,6 +46,15 @@ def main():
     VKMAIN = (ROOT / "gpu/vk/vk_main.cpp").read_text(encoding="utf-8")
     if "pipeline creates serialized (RADV)" not in VKMAIN or "RX_VK_PIPELINE_SERIAL" not in VKMAIN:
         raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
+    if "one driver thread" not in VKMAIN or "install_radv_driver_thread" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: RADV shader and pipeline calls must run on one driver thread")
+    if "predicting pipelines from" not in DRAW or "startup_driver_threads" not in DRAW:
+        raise SystemExit("vk_draw.cpp: prediction must log and honor RX_VK_PRECOMPILE_THREADS")
+    build = (ROOT / "nx2/build.py").read_text(encoding="utf-8")
+    if "stamp-ignore-begin" not in build:
+        raise SystemExit("nx2/build.py: the shader stamp must skip stamp-ignore regions")
+    if SHADER.count("// stamp-ignore-begin") != SHADER.count("// stamp-ignore-end"):
+        raise SystemExit("vk_shader.cpp: stamp-ignore markers are not paired")
     if "hookshot_vk_pipelines.bin" not in DRAW or "PipelineCreateLock" not in DRAW:
         raise SystemExit("vk_draw.cpp: the pipeline cache is Hookshot's, and creates take the RADV lock")
     if "st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT" not in DRAW or "mesh pipeline includes the task and mesh stages" not in DRAW:

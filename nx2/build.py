@@ -692,9 +692,28 @@ def main():
         # keeps them)
         stamp = hashlib.sha1()
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
+        def stamp_bytes(path, data):
+            # vk_shader.cpp is hashed whole. A lock or a cache-file recovery is not the translator: lines between
+            # these markers stay out of the stamp, so a locking-only build keeps hookshot_programs.bin.
+            data = data.replace(bytes((13, 10)), bytes((10,)))
+            if not path.replace("\\", "/").endswith("vk_shader.cpp"):
+                return data
+            out = bytearray()
+            skipping = False
+            for line in data.splitlines(keepends=True):
+                token = line.strip()
+                if not skipping and token == b"// stamp-ignore-begin":
+                    skipping = True
+                    continue
+                if skipping:
+                    if token == b"// stamp-ignore-end":
+                        skipping = False
+                    continue
+                out += line
+            return bytes(out)
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
-                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + stamp_bytes(f, src.read()))
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)

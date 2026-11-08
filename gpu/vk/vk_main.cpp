@@ -4,14 +4,19 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
 #include <mutex>
 #include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "vk_api.h"
@@ -722,8 +727,10 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
     if (radv_driver()) {
-        if (pipeline_creates_serialized())
-            logf("vk: pipeline creates serialized (RADV), and shader modules and layouts with them. RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
+        if (pipeline_creates_serialized()) {
+            install_radv_driver_thread();
+            logf("vk: pipeline creates serialized (RADV), on one driver thread, with shader modules, layouts and the pipeline cache. RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
+        }
         const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH");
         logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
              vangogh ? " on Van Gogh" : "");
@@ -766,14 +773,18 @@ namespace mkwvk {
 HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
 
 bool radv_driver() {
-    static const int id = [] {
-        if (!dev.physical) return 0;
+    // (a call before the device exists must not stick: the id would stay 0 and the lock would never come on)
+    if (!dev.physical) return false;
+    static int id = 0;
+    static bool known = false;
+    if (!known) {
         VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &dp;
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
-        return (int)dp.driverID;
-    }();
+        id = (int)dp.driverID;
+        known = true;
+    }
     return id == VK_DRIVER_ID_MESA_RADV;
 }
 
@@ -781,6 +792,7 @@ namespace {
 std::mutex pipeline_create_mu;
 }
 bool pipeline_creates_serialized() {
+    if (!dev.physical) return false;
     static const bool on = [] {
         if (!radv_driver()) return false;
         const char* e = getenv("RX_VK_PIPELINE_SERIAL");
@@ -795,6 +807,130 @@ PipelineCreateLock::PipelineCreateLock() {
 }
 PipelineCreateLock::~PipelineCreateLock() {
     if (held) pipeline_create_mu.unlock();
+}
+
+// (RADV) The prep workers used to take the lock and call the driver on themselves. A compile that keeps going on
+// that thread after vkCreate*Pipelines returns is then beside the next worker's call, which is the crash one thread
+// never hit. Every shader, layout, pipeline and pipeline-cache call is run here instead, on one thread, so the next
+// call joins the last. Translation stays on the workers. The lock above is not taken on this thread.
+namespace {
+thread_local bool on_radv_thread = false;
+std::mutex radv_mu;
+std::condition_variable radv_cv;
+std::deque<std::function<void()>> radv_q;
+std::once_flag radv_once;
+
+void radv_thread_main() {
+    on_radv_thread = true;
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk radv");
+    for (;;) {
+        std::function<void()> job;
+        {
+            std::unique_lock lk(radv_mu);
+            radv_cv.wait(lk, [] { return !radv_q.empty(); });
+            job = std::move(radv_q.front());
+            radv_q.pop_front();
+        }
+        job();
+    }
+}
+void radv_ensure_thread() {
+    std::call_once(radv_once, [] { std::thread(radv_thread_main).detach(); });
+}
+template <class F>
+auto radv_drive(F fn) -> decltype(fn()) {
+    using R = decltype(fn());
+    if (on_radv_thread) return fn();
+    radv_ensure_thread();
+    auto prom = std::make_shared<std::promise<R>>();
+    std::future<R> fut = prom->get_future();
+    {
+        std::lock_guard lk(radv_mu);
+        radv_q.push_back([fn, prom]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    fn();
+                    prom->set_value();
+                } else {
+                    prom->set_value(fn());
+                }
+            } catch (...) {
+                prom->set_exception(std::current_exception());
+            }
+        });
+    }
+    radv_cv.notify_one();
+    return fut.get();
+}
+
+#define RADV_RESULT(name, formal, actual)                                                                                  \
+    PFN_##name real_##name = nullptr;                                                                                      \
+    VkResult VKAPI_CALL name##_thr formal { return radv_drive([=] { return real_##name actual; }); }
+#define RADV_VOID(name, formal, actual)                                                                                    \
+    PFN_##name real_##name = nullptr;                                                                                      \
+    void VKAPI_CALL name##_thr formal { radv_drive([=] { real_##name actual; }); }
+
+RADV_RESULT(vkCreateShaderModule,
+            (VkDevice device, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* alloc, VkShaderModule* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyShaderModule, (VkDevice device, VkShaderModule mod, const VkAllocationCallbacks* alloc), (device, mod, alloc))
+RADV_RESULT(vkCreateDescriptorSetLayout,
+            (VkDevice device, const VkDescriptorSetLayoutCreateInfo* info, const VkAllocationCallbacks* alloc, VkDescriptorSetLayout* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyDescriptorSetLayout, (VkDevice device, VkDescriptorSetLayout layout, const VkAllocationCallbacks* alloc),
+          (device, layout, alloc))
+RADV_RESULT(vkCreatePipelineLayout,
+            (VkDevice device, const VkPipelineLayoutCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipelineLayout* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyPipelineLayout, (VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks* alloc), (device, layout, alloc))
+RADV_RESULT(vkCreateGraphicsPipelines,
+            (VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* alloc,
+             VkPipeline* out),
+            (device, cache, n, info, alloc, out))
+RADV_RESULT(vkCreateComputePipelines,
+            (VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo* info, const VkAllocationCallbacks* alloc,
+             VkPipeline* out),
+            (device, cache, n, info, alloc, out))
+RADV_VOID(vkDestroyPipeline, (VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* alloc), (device, pipeline, alloc))
+RADV_RESULT(vkCreatePipelineCache,
+            (VkDevice device, const VkPipelineCacheCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipelineCache* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyPipelineCache, (VkDevice device, VkPipelineCache cache, const VkAllocationCallbacks* alloc), (device, cache, alloc))
+RADV_RESULT(vkGetPipelineCacheData, (VkDevice device, VkPipelineCache cache, size_t* size, void* data), (device, cache, size, data))
+RADV_RESULT(vkCreateSampler, (VkDevice device, const VkSamplerCreateInfo* info, const VkAllocationCallbacks* alloc, VkSampler* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroySampler, (VkDevice device, VkSampler sampler, const VkAllocationCallbacks* alloc), (device, sampler, alloc))
+#undef RADV_RESULT
+#undef RADV_VOID
+} // namespace
+
+void install_radv_driver_thread() {
+    static bool installed = false;
+    if (installed || !pipeline_creates_serialized()) return;
+    installed = true;
+#define RADV_INSTALL(name)                                                                                                 \
+    do {                                                                                                                   \
+        if (vkx::name) {                                                                                                   \
+            real_##name = vkx::name;                                                                                       \
+            vkx::name = &name##_thr;                                                                                       \
+        }                                                                                                                  \
+    } while (0)
+    RADV_INSTALL(vkCreateShaderModule);
+    RADV_INSTALL(vkDestroyShaderModule);
+    RADV_INSTALL(vkCreateDescriptorSetLayout);
+    RADV_INSTALL(vkDestroyDescriptorSetLayout);
+    RADV_INSTALL(vkCreatePipelineLayout);
+    RADV_INSTALL(vkDestroyPipelineLayout);
+    RADV_INSTALL(vkCreateGraphicsPipelines);
+    RADV_INSTALL(vkCreateComputePipelines);
+    RADV_INSTALL(vkDestroyPipeline);
+    RADV_INSTALL(vkCreatePipelineCache);
+    RADV_INSTALL(vkDestroyPipelineCache);
+    RADV_INSTALL(vkGetPipelineCacheData);
+    RADV_INSTALL(vkCreateSampler);
+    RADV_INSTALL(vkDestroySampler);
+#undef RADV_INSTALL
+    radv_ensure_thread();
 }
 
 bool radv_mesh_payload_barrier() {

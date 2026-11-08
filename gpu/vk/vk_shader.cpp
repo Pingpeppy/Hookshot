@@ -546,9 +546,10 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
     VkShaderModule m = VK_NULL_HANDLE;
-    // (the SPIR-V is already built, on this worker, in parallel. RADV's compiler is what four prep threads wrote
-    // through: a null+0x40 store in libvulkan_radeon.so that one thread did not hit. Same lock as the pipeline creates)
+    // stamp-ignore-begin
+    // (the SPIR-V is already built, on this worker, in parallel. The driver call itself runs on RADV's one thread)
     PipelineCreateLock lock;
+    // stamp-ignore-end
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
     return m;
 }
@@ -920,6 +921,42 @@ void disk_init() {
             }
         }
         const uint64_t stamp = disk_stamp();
+        // stamp-ignore-begin
+        // (a locking-only build used to change this stamp and rename the good cache to .rejected. If that copy's
+        // stamp is this build's, put it back. The file that does not match is kept beside it, not deleted)
+        {
+            const std::string rejected = path + ".rejected";
+            auto header_stamp = [](const std::string& p, int64_t* size) -> uint64_t {
+                if (size) *size = 0;
+                FILE* rf = fopen(p.c_str(), "rb");
+                if (!rf) return 0;
+                _fseeki64(rf, 0, SEEK_END);
+                const int64_t whole = _ftelli64(rf);
+                if (size) *size = whole;
+                _fseeki64(rf, 0, SEEK_SET);
+                uint32_t head[2]{};
+                uint64_t kept = 0;
+                const bool ok = whole >= 16 && fread(head, 4, 2, rf) == 2 && fread(&kept, 8, 1, rf) == 1 && head[0] == kDiskMagic;
+                fclose(rf);
+                return ok ? kept : 0;
+            };
+            int64_t live_size = 0, rejected_size = 0;
+            const uint64_t live_stamp = header_stamp(path, &live_size);
+            const uint64_t rejected_stamp = header_stamp(rejected, &rejected_size);
+            if (live_stamp != stamp && rejected_stamp == stamp && rejected_size > 16) {
+                const std::string aside = path + ".stamp-mismatch";
+                ::remove(aside.c_str());
+                ::rename(path.c_str(), aside.c_str());
+                if (::rename(rejected.c_str(), path.c_str()) != 0) {
+                    ::rename(aside.c_str(), path.c_str());
+                    logf("vk: program cache: the copy set aside matches this stamp but could not be put back");
+                } else {
+                    logf("vk: program cache stamp matches the copy set aside (%lld MB): using that. The other file is %s",
+                         (long long)(rejected_size >> 20), aside.c_str());
+                }
+            }
+        }
+        // stamp-ignore-end
         int64_t good = 0, whole = 0;
         if (FILE* f = fopen(path.c_str(), "rb")) {
             _fseeki64(f, 0, SEEK_END);
@@ -1876,7 +1913,9 @@ void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn)
     program_cache_load(key, variants, true);
     for (auto& p : variants) {
         fn(*p);
+        // stamp-ignore-begin
         PipelineCreateLock lock;
+        // stamp-ignore-end
         for (Stage& st : p->stages)
             if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
         if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
@@ -2134,7 +2173,9 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
         return t;
     };
     const auto drop = [](Try& t) {
+        // stamp-ignore-begin
         PipelineCreateLock lock;
+        // stamp-ignore-end
         for (Stage& st : t.p->stages)
             if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
     };
