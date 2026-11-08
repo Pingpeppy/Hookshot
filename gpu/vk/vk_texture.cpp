@@ -1435,7 +1435,7 @@ void destroy_later(Texture& tex) {
     destroy_gen++;
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     for (auto& kv : tex.views)
-        if (kv.second) d.views.push_back(kv.second);
+        if (kv.second && !texture_is_proxy_view(&tex, kv.second)) d.views.push_back(kv.second);
     for (auto& kv : tex.block_proxy) {
         Dead p{tex.last_value, kv.second.image, kv.second.allocation, {}, {}};
         if (kv.second.view) p.views.push_back(kv.second.view);
@@ -2257,6 +2257,14 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
         // Integer block views are rejected when the swizzle is R/G/B/A rather than IDENTITY.
         const VkComponentMapping identity{};
         view = make_view(tex, type, f, aspect, level0, nlevels, layer0, nlayers, identity, usage);
+    }
+    if (!view && type == VK_IMAGE_VIEW_TYPE_2D && nlevels == 1 && nlayers == 1 && is_bc(tex->format) && !is_bc(f)) {
+        // One block per texel (BC4 as R16G16B16A16_UINT, and the same for the other BC formats). The image cannot
+        // carry that view, so the draw uses the block proxy instead of a missing view (a missing one is the dummy,
+        // which reads as empty and flashes white). Attachments are copied back at the end of the pass; storage
+        // writes are copied back after the dispatch.
+        VkImageView proxy = VK_NULL_HANDLE;
+        if (texture_block_proxy(tex, level0, layer0, f, &proxy, nullptr, nullptr)) view = proxy;
     }
     if (!view) {
         static int logged;
@@ -3520,9 +3528,13 @@ bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat 
     ci.extent = {pw, ph, 1};
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
-    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     Texture::BlockProxy made;
-    if (!create_image(ci, made.image, made.allocation, false, MemTag::RenderTarget)) return false;
+    if (!create_image(ci, made.image, made.allocation, false, MemTag::RenderTarget)) {
+        ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!create_image(ci, made.image, made.allocation, false, MemTag::RenderTarget)) return false;
+    }
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = made.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -3535,12 +3547,36 @@ bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat 
     made.format = view_format;
     made.width = pw;
     made.height = ph;
-    proxy_barrier(upload_cmd(), made.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, 0);
+    VkCommandBuffer seed = upload_cmd();
+    proxy_barrier(seed, made.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 0);
+    bool filled = false;
+    if (tex->image && (tex->uploaded || tex->gpu_written)) {
+        // The proxy starts undefined. Copying it back unfilled paints the blocks the pass did not write (white
+        // flashes over a BC render target). The upload buffer runs before this recording's draws.
+        proxy_barrier(seed, tex->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, level, layer);
+        proxy_barrier(seed, made.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 0);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {pw, ph, 1};
+        vkCmdCopyImage(seed, tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, made.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        proxy_barrier(seed, tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_SHADER_READ_BIT, level, layer);
+        proxy_barrier(seed, made.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, 0);
+        filled = true;
+    } else {
+        proxy_barrier(seed, made.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, 0);
+    }
     static int logged;
     if (logged++ < 8)
-        logf("vk: BC texture %#llx rendered through a block proxy (format %d, %ux%u x layer %u)",
-             (unsigned long long)tex->gpu, (int)view_format, pw, ph, layer);
+        logf("vk: BC texture %#llx rendered through a block proxy (format %d, %ux%u x layer %u%s)",
+             (unsigned long long)tex->gpu, (int)view_format, pw, ph, layer, filled ? ", filled from the block image" : "");
     tex->block_proxy[key] = made;
     if (view) *view = made.view;
     if (width) *width = pw;
@@ -3559,7 +3595,8 @@ void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level,
     if (it == tex->block_proxy.end() || !it->second.image) return;
     const Texture::BlockProxy& p = it->second;
     proxy_barrier(cmd, p.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, 0, 0);
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT, 0, 0);
     proxy_barrier(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, level, layer);
     VkImageCopy region{};
@@ -3573,6 +3610,26 @@ void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level,
                   VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, level, layer);
     texture_written(tex);
     texture_rendered(tex);
+}
+
+namespace {
+thread_local std::vector<Texture*> proxy_stores;
+}
+
+void texture_proxy_note_store(Texture* tex) {
+    if (!tex || tex->block_proxy.empty()) return;
+    for (Texture* t : proxy_stores)
+        if (t == tex) return;
+    proxy_stores.push_back(tex);
+}
+
+void texture_proxy_writeback(VkCommandBuffer cmd) {
+    if (!cmd || proxy_stores.empty()) return;
+    std::vector<Texture*> todo;
+    todo.swap(proxy_stores);
+    for (Texture* t : todo)
+        for (const auto& kv : t->block_proxy)
+            texture_block_proxy_copy(cmd, t, (uint32_t)(kv.first >> 32), (uint32_t)kv.first);
 }
 
 } // namespace mkwvk

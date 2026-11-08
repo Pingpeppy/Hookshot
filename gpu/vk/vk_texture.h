@@ -159,6 +159,9 @@ bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat 
                          uint32_t* width, uint32_t* height);
 bool texture_is_proxy_view(const Texture* tex, VkImageView view);
 void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer);
+/// A storage write into a block proxy: copied back after the pass or the dispatch, not while it is still bound
+void texture_proxy_note_store(Texture* tex);
+void texture_proxy_writeback(VkCommandBuffer cmd);
 /// The presents so far (the frame number textures are aged by)
 uint64_t texture_frame_no();
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)

@@ -2207,6 +2207,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level)
                                           : VK_NULL_HANDLE;
                 if (view && tex && d.is_written) { ParLock lk; texture_written(tex); }
+                if (view && tex && d.is_written && texture_is_proxy_view(tex, view)) texture_proxy_note_store(tex);
                 if (view && tex) draw_sampled.push_back(tex);
                 if (log_img_wanted(p.key)) {
                     static std::atomic<int> told{0};
@@ -2706,7 +2707,13 @@ Targets targets(NvnState& s) {
         at.color[i] = tex, at.color_view[i] = view, at.color_format[i] = f;
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
-        const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        // A block proxy is one texel per block. The game's viewport is that size; the BC image's pixel size is four
+        // times it, and using that clips the draw into the corner and copies the rest back unfilled.
+        if (texture_is_proxy_view(tex, view)) {
+            w = std::max(1u, (w + 3) / 4);
+            h = std::max(1u, (h + 3) / 4);
+        }
         at.width = at.width ? std::min(at.width, w) : w;
         at.height = at.height ? std::min(at.height, h) : h;
         at.samples = tex->samples;
@@ -3768,6 +3775,7 @@ void end_pass(VkCommandBuffer cmd) {
     for (int i = 0; i < pass.n; i++)
         if (pass.tex[i] && texture_is_proxy_view(pass.tex[i], pass.color[i]))
             texture_block_proxy_copy(cmd, pass.tex[i], pass.level[i], pass.layer[i]);
+    texture_proxy_writeback(cmd);
     if (dump_on() && !dump_mesh_indirect.empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);
@@ -6486,6 +6494,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         } else {
             vkCmdDispatch(cmd, x, y, z);
         }
+        texture_proxy_writeback(cmd);
     }
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
     if (gprof_on()) {
