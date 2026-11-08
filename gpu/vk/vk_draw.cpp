@@ -596,7 +596,6 @@ void ensure_layout(Program& p) {
     if (p.push) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = (uint32_t)bindings.size();
     li.pBindings = bindings.data();
-    vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set_layout);
     VkShaderStageFlags stages = 0;
     for (const Stage& st : p.stages) stages |= st.vk_stage;
     const VkPushConstantRange range{stages, 0, kPushSize};
@@ -606,7 +605,12 @@ void ensure_layout(Program& p) {
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &range;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+    {
+        // (prep workers call this together, before the pipeline create, which already takes the lock)
+        PipelineCreateLock lock;
+        vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set_layout);
+        vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+    }
     p.push_stages = stages;
     for (const Stage& st : p.stages) p.uses_render_area |= st.info.uses_render_area;
     p.uses_push = p.uses_render_area;
@@ -895,7 +899,10 @@ VkPipeline gpl_part(const Program& p, const NvnState& s, const Targets& at, VkPr
     if (!made) return VK_NULL_HANDLE;
     std::lock_guard lk(gpl_mu);
     const auto [it, fresh] = gpl_libs.emplace(key, made);
-    if (!fresh) vkDestroyPipeline(dev.device, made, nullptr);
+    if (!fresh) {
+        PipelineCreateLock lock;
+        vkDestroyPipeline(dev.device, made, nullptr);
+    }
     return it->second;
 }
 VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
@@ -3251,6 +3258,7 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
         VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         li.pushConstantRangeCount = 1;
         li.pPushConstantRanges = &r;
+        PipelineCreateLock lock;
         vkCreatePipelineLayout(dev.device, &li, nullptr, &clear_layout);
     }
     const uint32_t* fw = kind == 1 ? CLEAR_U_FRAG_SPV : kind == 2 ? CLEAR_I_FRAG_SPV : CLEAR_F_FRAG_SPV;
@@ -3259,9 +3267,12 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     mi.codeSize = sizeof CLEAR_VERT_SPV, mi.pCode = CLEAR_VERT_SPV;
-    vkCreateShaderModule(dev.device, &mi, nullptr, &vm);
-    mi.codeSize = frag.size() * 4, mi.pCode = frag.data();
-    vkCreateShaderModule(dev.device, &mi, nullptr, &fm);
+    {
+        PipelineCreateLock lock;
+        vkCreateShaderModule(dev.device, &mi, nullptr, &vm);
+        mi.codeSize = frag.size() * 4, mi.pCode = frag.data();
+        vkCreateShaderModule(dev.device, &mi, nullptr, &fm);
+    }
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT, st[0].module = vm, st[0].pName = "main";
@@ -3298,8 +3309,11 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
     ci.layout = clear_layout;
     VkPipeline pl = VK_NULL_HANDLE;
     { PipelineCreateLock lock; vkCreateGraphicsPipelines(dev.device, pcache, 1, &ci, nullptr, &pl); }
-    vkDestroyShaderModule(dev.device, vm, nullptr);
-    vkDestroyShaderModule(dev.device, fm, nullptr);
+    {
+        PipelineCreateLock lock;
+        vkDestroyShaderModule(dev.device, vm, nullptr);
+        vkDestroyShaderModule(dev.device, fm, nullptr);
+    }
     clear_pipes[key] = pl;
     return pl;
 }
@@ -5460,20 +5474,23 @@ bool movie_upscale(VkCommandBuffer cmd, uint32_t in_handle, uint32_t out_handle,
         li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         li.bindingCount = 2, li.pBindings = bind;
         VkDescriptorSetLayout set{};
-        vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
         const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
         VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
-        vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = sizeof MOVIE_UPSCALE_COMP_SPV, mi.pCode = MOVIE_UPSCALE_COMP_SPV;
         VkShaderModule m{};
-        vkCreateShaderModule(dev.device, &mi, nullptr, &m);
+        {
+            PipelineCreateLock lock;
+            vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
+            vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+            vkCreateShaderModule(dev.device, &mi, nullptr, &m);
+        }
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
         ci.layout = layout;
         { PipelineCreateLock lock; if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE; }
-        vkDestroyShaderModule(dev.device, m, nullptr);
+        { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -5667,20 +5684,23 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
         li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         li.bindingCount = 3, li.pBindings = b;
         VkDescriptorSetLayout set{};
-        vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
         const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
         VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
-        vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = sizeof TAAU_UPSCALE_COMP_SPV, mi.pCode = TAAU_UPSCALE_COMP_SPV;
         VkShaderModule m{};
-        vkCreateShaderModule(dev.device, &mi, nullptr, &m);
+        {
+            PipelineCreateLock lock;
+            vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set);
+            vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+            vkCreateShaderModule(dev.device, &mi, nullptr, &m);
+        }
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
         ci.layout = layout;
         { PipelineCreateLock lock; if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE; }
-        vkDestroyShaderModule(dev.device, m, nullptr);
+        { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -5852,12 +5872,16 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
         // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
         // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
         if (guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
-            vkDestroyPipeline(dev.device, pl, nullptr);
             libs++;
             pcache_built_since_save++;
+            PipelineCreateLock lock;
+            vkDestroyPipeline(dev.device, pl, nullptr);
         }
-        if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
-        if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+        {
+            PipelineCreateLock lock;
+            if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
+            if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+        }
     };
     const auto worker = [&] {
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
@@ -5880,14 +5904,18 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
                     Targets at{};
                     for (int part = 1; part <= 2; part++)
                         if (const VkPipeline lib = build_graphics(*p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part)) {
-                            vkDestroyPipeline(dev.device, lib, nullptr);
                             libs++;
+                            PipelineCreateLock lock;
+                            vkDestroyPipeline(dev.device, lib, nullptr);
                         }
                 }
-                for (Stage& st : p->stages)
-                    if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
-                if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
-                if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+                {
+                    PipelineCreateLock lock;
+                    for (Stage& st : p->stages)
+                        if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+                    if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
+                    if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+                }
             }
             done++;
         }
@@ -6001,7 +6029,10 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 }
                 std::lock_guard lk(pre->mu);
                 if (!pre->abandoned) p.compute_pipeline = made;
-                else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
+                else if (made) {   // (the game went on: it builds its own)
+                    PipelineCreateLock lock;
+                    vkDestroyPipeline(dev.device, made, nullptr);
+                }
             } else {
                 PipeNote& n = *notes[i - computes.size()];
                 const Program* p = program_find(n.prog, n.variant);
@@ -6080,8 +6111,11 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
                 ensure_layout(p);
                 for (const PipeNote* n : list)
                     if (n->variant == p.variant)
-                        if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
-                            vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                        if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo)) {
+                            PipelineCreateLock lock;
+                            vkDestroyPipeline(dev.device, pl, nullptr);
+                            made++;
+                        }
             });
             done += list.size();
         }

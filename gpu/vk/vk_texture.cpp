@@ -296,19 +296,22 @@ bool astc_ready() {
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = 2;
     li.pBindings = b;
-    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &astc_set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(AstcPush)};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
     pi.pSetLayouts = &astc_set;
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &pr;
-    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &astc_layout) != VK_SUCCESS) return false;
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = sizeof ASTC_DECODER_COMP_SPV;
     mi.pCode = ASTC_DECODER_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    {
+        PipelineCreateLock lock;
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &astc_set) != VK_SUCCESS) return false;
+        if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &astc_layout) != VK_SUCCESS) return false;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    }
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -317,7 +320,7 @@ bool astc_ready() {
     ci.layout = astc_layout;
     VkResult r;
     { PipelineCreateLock lock; r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &astc_pipe); }
-    vkDestroyShaderModule(dev.device, m, nullptr);
+    { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
     if (r != VK_SUCCESS) return false;
     state = 1;
     logf("vk: ASTC is decoded on the GPU (Eden's decoder, Switch 2 tiling)");
@@ -449,19 +452,22 @@ bool bc_ready() {
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = 2;
     li.pBindings = b;
-    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &bc_set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BcPush)};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
     pi.pSetLayouts = &bc_set;
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &pr;
-    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &bc_layout) != VK_SUCCESS) return false;
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = sizeof BC_ENCODER_COMP_SPV;
     mi.pCode = BC_ENCODER_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    {
+        PipelineCreateLock lock;
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &bc_set) != VK_SUCCESS) return false;
+        if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &bc_layout) != VK_SUCCESS) return false;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    }
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -470,7 +476,7 @@ bool bc_ready() {
     ci.layout = bc_layout;
     VkResult r;
     { PipelineCreateLock lock; r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &bc_pipe); }
-    vkDestroyShaderModule(dev.device, m, nullptr);
+    { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
     if (r != VK_SUCCESS) return false;
     state = 1;
     logf("vk: big ASTC textures are kept as BC3 (re-encoded on the GPU; RX_VK_ASTC_RGBA8=1: as RGBA8)");
@@ -833,19 +839,22 @@ bool unswizzle_ready() {
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = 2;
     li.pBindings = b;
-    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &unsw_set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(UnswizzlePush)};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
     pi.pSetLayouts = &unsw_set;
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &pr;
-    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &unsw_layout) != VK_SUCCESS) return false;
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = sizeof BLOCK_LINEAR_UNSWIZZLE_2D_COMP_SPV;
     mi.pCode = BLOCK_LINEAR_UNSWIZZLE_2D_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    {
+        PipelineCreateLock lock;
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &unsw_set) != VK_SUCCESS) return false;
+        if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &unsw_layout) != VK_SUCCESS) return false;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    }
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -854,7 +863,7 @@ bool unswizzle_ready() {
     ci.layout = unsw_layout;
     VkResult r;
     { PipelineCreateLock lock; r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &unsw_pipe); }
-    vkDestroyShaderModule(dev.device, m, nullptr);
+    { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
     if (r != VK_SUCCESS) return false;
     state = 1;
     logf("vk: big block-linear textures are unswizzled on the GPU from their pools (RX_VK_GPU_UNSWIZZLE=0: the CPU)");

@@ -546,6 +546,9 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
     VkShaderModule m = VK_NULL_HANDLE;
+    // (the SPIR-V is already built, on this worker, in parallel. RADV's compiler is what four prep threads wrote
+    // through: a null+0x40 store in libvulkan_radeon.so that one thread did not hit. Same lock as the pipeline creates)
+    PipelineCreateLock lock;
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
     return m;
 }
@@ -1873,6 +1876,7 @@ void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn)
     program_cache_load(key, variants, true);
     for (auto& p : variants) {
         fn(*p);
+        PipelineCreateLock lock;
         for (Stage& st : p->stages)
             if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
         if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
@@ -2130,6 +2134,7 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
         return t;
     };
     const auto drop = [](Try& t) {
+        PipelineCreateLock lock;
         for (Stage& st : t.p->stages)
             if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
     };

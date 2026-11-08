@@ -723,7 +723,7 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
          dev.graphics_pipeline_library ? "yes" : "no");
     if (radv_driver()) {
         if (pipeline_creates_serialized())
-            logf("vk: pipeline creates serialized (RADV). RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
+            logf("vk: pipeline creates serialized (RADV), and shader modules and layouts with them. RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
         const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH");
         logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
              vangogh ? " on Van Gogh" : "");

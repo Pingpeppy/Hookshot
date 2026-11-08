@@ -33,7 +33,9 @@ void queue_flush();          // (the same, taking dev.present_mu)
 void pace_fps_cap();         // (RX_VK_FPS_CAP, before a present)
 bool radv_driver();
 bool radv_mesh_payload_barrier();
-/// RADV serializes vkCreate*Pipelines and vkGetPipelineCacheData. RX_VK_PIPELINE_SERIAL=0 leaves them parallel.
+/// RADV serializes vkCreate*Pipelines, vkGetPipelineCacheData, and the shader-module and layout
+/// creates and destroys the prep workers do beside them. The CPU translation stays outside this lock.
+/// RX_VK_PIPELINE_SERIAL=0 leaves them parallel. The mutex is not recursive.
 bool pipeline_creates_serialized();
 struct PipelineCreateLock {
     bool held = false;

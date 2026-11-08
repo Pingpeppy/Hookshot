@@ -140,15 +140,18 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 1, dli.pBindings = &b;
     VkDescriptorSetLayout dsl{};
-    vkCreateDescriptorSetLayout(dev.device, &dli, nullptr, &dsl);
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1, pli.pSetLayouts = &dsl;
     VkPipelineLayout layout{};
-    vkCreatePipelineLayout(dev.device, &pli, nullptr, &layout);
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size() * 4, smi.pCode = code.data();
     VkShaderModule module{};
-    vkCreateShaderModule(dev.device, &smi, nullptr, &module);
+    {
+        PipelineCreateLock lock;
+        vkCreateDescriptorSetLayout(dev.device, &dli, nullptr, &dsl);
+        vkCreatePipelineLayout(dev.device, &pli, nullptr, &layout);
+        vkCreateShaderModule(dev.device, &smi, nullptr, &module);
+    }
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
@@ -208,13 +211,19 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
         vkDestroyFence(dev.device, fence, nullptr);
         vkDestroyCommandPool(dev.device, cmd_pool, nullptr);
         vkDestroyDescriptorPool(dev.device, pool, nullptr);
-        vkDestroyPipeline(dev.device, pipeline, nullptr);
+        {
+            PipelineCreateLock lock;
+            vkDestroyPipeline(dev.device, pipeline, nullptr);
+        }
     } else {
         logf("vk: cooperative matrix test: pipeline creation failed (%d)", (int)pr);
     }
-    if (module) vkDestroyShaderModule(dev.device, module, nullptr);
-    vkDestroyPipelineLayout(dev.device, layout, nullptr);
-    vkDestroyDescriptorSetLayout(dev.device, dsl, nullptr);
+    {
+        PipelineCreateLock lock;
+        if (module) vkDestroyShaderModule(dev.device, module, nullptr);
+        vkDestroyPipelineLayout(dev.device, layout, nullptr);
+        vkDestroyDescriptorSetLayout(dev.device, dsl, nullptr);
+    }
     vkDestroyBuffer(dev.device, buffer, nullptr);
     vkFreeMemory(dev.device, memory, nullptr);
     return ok;
