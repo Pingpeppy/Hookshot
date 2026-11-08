@@ -2679,7 +2679,20 @@ Targets targets(NvnState& s) {
         const nvn_view* v = s.rt.has_cview[i] ? &s.rt.cview[i] : nullptr;
         VkFormat f = VK_FORMAT_UNDEFINED;
         const VkImageView view = texture_view(tex, t, v, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment, &f);
-        if (!view) continue;
+        if (!view) {
+            uint32_t pw = 0, ph = 0;
+            VkImageView proxy = VK_NULL_HANDLE;
+            const uint32_t level = image_level(tex, view_level(v));
+            const uint32_t layer = v ? view_layer(v) : 0;
+            if (f != VK_FORMAT_UNDEFINED && texture_block_proxy(tex, level, layer, f, &proxy, &pw, &ph)) {
+                at.color[i] = tex, at.color_view[i] = proxy, at.color_format[i] = f;
+                at.color_level[i] = level, at.color_layer[i] = layer;
+                at.width = at.width ? std::min(at.width, pw) : pw;
+                at.height = at.height ? std::min(at.height, ph) : ph;
+                at.samples = tex->samples;
+            }
+            continue;
+        }
         at.color[i] = tex, at.color_view[i] = view, at.color_format[i] = f;
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
@@ -3735,6 +3748,9 @@ void end_pass(VkCommandBuffer cmd) {
     if (!pass.open) return;
     vkCmdEndRendering(cmd);
     pass.open = false;
+    for (int i = 0; i < pass.n; i++)
+        if (pass.tex[i] && texture_is_proxy_view(pass.tex[i], pass.color[i]))
+            texture_block_proxy_copy(cmd, pass.tex[i], pass.level[i], pass.layer[i]);
     if (dump_on() && !dump_mesh_indirect.empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);

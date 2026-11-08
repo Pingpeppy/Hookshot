@@ -1426,6 +1426,12 @@ void destroy_later(Texture& tex) {
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     for (auto& kv : tex.views)
         if (kv.second) d.views.push_back(kv.second);
+    for (auto& kv : tex.block_proxy) {
+        Dead p{tex.last_value, kv.second.image, kv.second.allocation, {}, {}};
+        if (kv.second.view) p.views.push_back(kv.second.view);
+        dead.push_back(std::move(p));
+    }
+    tex.block_proxy.clear();
     d.memory = tex.sparse_chunks;
     dead.push_back(std::move(d));
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
@@ -3361,6 +3367,132 @@ void texture_read_texels(const nvn_tex* t, unsigned level, unsigned layer0, cons
         auto [a, b] = by_gpu.equal_range(t->gpu);
         for (auto it = a; it != b; ++it) it->second->gpu_written = false, it->second->checked_epoch = 0;
     }
+}
+
+namespace {
+bool bc_proxy_on() {
+    if (const char* e = getenv("RX_VK_BC_PROXY")) return e[0] != '0';
+    return true;
+}
+int bc_block_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK:
+        return 8;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 16;
+    default: return 0;
+    }
+}
+int uncompressed_texel_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return 16;
+    default: return 0;
+    }
+}
+void proxy_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags2 src, VkAccessFlags2 dst,
+                   uint32_t level, uint32_t layer) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = src;
+    b.dstAccessMask = dst;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, layer, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+} // namespace
+
+bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat view_format, VkImageView* view, uint32_t* width,
+                         uint32_t* height) {
+    if (view) *view = VK_NULL_HANDLE;
+    if (!bc_proxy_on() || !tex || !is_bc(tex->format)) return false;
+    const int block = bc_block_bytes(tex->format);
+    if (!block || block != uncompressed_texel_bytes(view_format)) return false;
+    const uint64_t key = (uint64_t)level << 32 | layer;
+    auto it = tex->block_proxy.find(key);
+    if (it != tex->block_proxy.end() && it->second.view && it->second.format == view_format) {
+        if (view) *view = it->second.view;
+        if (width) *width = it->second.width;
+        if (height) *height = it->second.height;
+        return true;
+    }
+    const uint32_t pw = std::max(1u, (std::max(1u, tex->width >> level) + 3) / 4);
+    const uint32_t ph = std::max(1u, (std::max(1u, tex->height >> level) + 3) / 4);
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = view_format;
+    ci.extent = {pw, ph, 1};
+    ci.mipLevels = ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    Texture::BlockProxy made;
+    if (!create_image(ci, made.image, made.allocation, false, MemTag::RenderTarget)) return false;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = made.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = view_format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev.device, &vi, nullptr, &made.view) != VK_SUCCESS) {
+        destroy_image(made.image, made.allocation);
+        return false;
+    }
+    made.format = view_format;
+    made.width = pw;
+    made.height = ph;
+    proxy_barrier(upload_cmd(), made.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, 0);
+    static int logged;
+    if (logged++ < 8)
+        logf("vk: BC texture %#llx rendered through a block proxy (format %d, %ux%u x layer %u)",
+             (unsigned long long)tex->gpu, (int)view_format, pw, ph, layer);
+    tex->block_proxy[key] = made;
+    if (view) *view = made.view;
+    if (width) *width = pw;
+    if (height) *height = ph;
+    return true;
+}
+bool texture_is_proxy_view(const Texture* tex, VkImageView view) {
+    if (!tex || !view) return false;
+    for (const auto& kv : tex->block_proxy)
+        if (kv.second.view == view) return true;
+    return false;
+}
+void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer) {
+    if (!cmd || !tex) return;
+    auto it = tex->block_proxy.find((uint64_t)level << 32 | layer);
+    if (it == tex->block_proxy.end() || !it->second.image) return;
+    const Texture::BlockProxy& p = it->second;
+    proxy_barrier(cmd, p.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, 0, 0);
+    proxy_barrier(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, level, layer);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+    region.extent = {p.width, p.height, 1};
+    vkCmdCopyImage(cmd, p.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    proxy_barrier(cmd, p.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_ACCESS_2_TRANSFER_READ_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, 0);
+    proxy_barrier(cmd, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, level, layer);
+    texture_written(tex);
+    texture_rendered(tex);
 }
 
 } // namespace mkwvk

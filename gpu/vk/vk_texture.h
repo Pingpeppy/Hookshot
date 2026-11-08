@@ -82,6 +82,16 @@ struct Texture {
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
     std::unordered_map<uint64_t, VkImageView> views;
+    // (a BC image cannot be a colour attachment. When the game renders one block per texel of an uncompressed
+    // view, that view is this image and is copied back into the BC image at the end of the pass. RX_VK_BC_PROXY=0: off)
+    struct BlockProxy {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        uint32_t width = 0, height = 0;
+    };
+    std::unordered_map<uint64_t, BlockProxy> block_proxy;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident
@@ -143,6 +153,12 @@ void texture_gpu_wrote(uint64_t gpu, uint64_t size);
 void texture_watch_prog(uint64_t prog);
 /// A pass renders into it (first_render_frame)
 void texture_rendered(Texture* tex);
+/// A colour view of a BC image the game renders one block per texel. False when the formats are not the same size,
+/// or RX_VK_BC_PROXY=0. *view / *width / *height are the proxy's.
+bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat view_format, VkImageView* view,
+                         uint32_t* width, uint32_t* height);
+bool texture_is_proxy_view(const Texture* tex, VkImageView view);
+void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer);
 /// The presents so far (the frame number textures are aged by)
 uint64_t texture_frame_no();
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
