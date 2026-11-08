@@ -33,6 +33,8 @@ bool radv_driver();          // (Mesa RADV; false until the device exists)
 bool low_mem_mode();
 /// That mode, and the feature's own switch is not 0 (RX_VK_LOW_TEX, RX_VK_LOW_CAPTURES, ...).
 bool low_mem_on(const char* off_switch);
+/// Drop the program-cache file from the page cache. The index stays.
+void program_cache_reclaim();
 /// Output-memory semantics on task payload barriers. On for RADV unless RX_VK_MESH_PAYLOAD_BARRIER=0.
 bool radv_mesh_payload_barrier();
 void pace_fps_cap();         // (RX_VK_FPS_CAP: do not present faster than this)

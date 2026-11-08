@@ -19,6 +19,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#ifndef _WIN32
+#include <malloc.h>
+#endif
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -2570,6 +2573,10 @@ Texture* texture_for_present(const nvn_tex* t) {
     return best ? best : tex;
 }
 
+std::atomic<int> mem_squeeze{0};
+bool texture_squeeze() { return mem_squeeze.load(std::memory_order_relaxed) != 0; }
+void shader_stats(int64_t* translated, int64_t* failed);
+
 void texture_frame(uint64_t completed) {
     completed_value = completed;
     frame_no++;
@@ -2588,7 +2595,7 @@ void texture_frame(uint64_t completed) {
             kept += it->size;
             ++it;
         }
-        const uint64_t mem_every = low_mem_mode() ? 120 : 600;
+        const uint64_t mem_every = low_mem_mode() ? 30 : 600;
         if (frame_no % mem_every == 0) {   // (the process's memory now and then: what the host side holds)
             PROCESS_MEMORY_COUNTERS_EX pm{};
             pm.cb = sizeof pm;
@@ -2608,12 +2615,34 @@ void texture_frame(uint64_t completed) {
 #endif
                 uint64_t block_free = 0;
                 vram_usage(&gpu_used, &gpu_allowed, &block_free);
-                logf("vk: memory: RSS %llu MB (peak %llu), private %llu MB, MemAvailable %llu MB, swap free %llu MB, "
-                     "GPU %llu/%llu MB, staging %llu MB in %zu arenas, textures %llu MB",
+                unsigned long long proc_swap_kb = 0;
+#ifndef _WIN32
+                if (FILE* sf = fopen("/proc/self/status", "r")) {
+                    char sline[160];
+                    while (fgets(sline, sizeof sline, sf))
+                        if (sscanf(sline, "VmSwap: %llu", &proc_swap_kb) == 1) break;
+                    fclose(sf);
+                }
+#endif
+                const unsigned long long resident_mb = (unsigned long long)(pm.WorkingSetSize >> 20) + (proc_swap_kb >> 10);
+                if (low_mem_mode() && resident_mb > 5600) {
+                    if (!mem_squeeze.exchange(1))
+                        logf("vk: hard memory budget: RSS+swap %llu MB is over 5600 MB. Textures drop to 640 MB and the "
+                             "program-cache file is dropped from the page cache. HOS_MEMORY_MB is the game's own heap.",
+                             resident_mb);
+                    program_cache_reclaim();
+                    malloc_trim(0);
+                }
+                int64_t translated = 0, failed = 0;
+                shader_stats(&translated, &failed);
+                logf("vk: memory: RSS %llu MB (peak %llu), private %llu MB, this process swapped %llu MB, MemAvailable %llu MB, "
+                     "swap free %llu MB, GPU %llu/%llu MB, staging %llu MB in %zu arenas, textures %llu MB, "
+                     "program cache translated %lld",
                      (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20),
-                     (unsigned long long)(pm.PrivateUsage >> 20), avail_kb >> 10, swap_kb >> 10,
+                     (unsigned long long)(pm.PrivateUsage >> 20), proc_swap_kb >> 10, avail_kb >> 10, swap_kb >> 10,
                      (unsigned long long)(gpu_used >> 20), (unsigned long long)(gpu_allowed >> 20),
-                     (unsigned long long)(kept >> 20), arenas.size(), (unsigned long long)(total_bytes >> 20));
+                     (unsigned long long)(kept >> 20), arenas.size(), (unsigned long long)(total_bytes >> 20),
+                     (long long)translated);
                 if (avail_kb && avail_kb < 400ull * 1024)
                     logf("vk: memory critically low (%llu MB available). A compositor may close the window; that log line is not a GPU reset",
                          avail_kb >> 10);
@@ -2643,12 +2672,13 @@ void texture_frame(uint64_t completed) {
                                                                                              // card's 10.8 GB filled up, read as a leak: 105, 106)
                                      : 4096ull << 20;
     uint64_t budget = (opts.vram_mb > 0) ? ((uint64_t)opts.vram_mb << 20) : own;
-    if (low_mem_on("RX_VK_LOW_TEX") && !getenv("RX_VK_VRAM_MB") && budget > (1280ull << 20)) {
+    if (low_mem_on("RX_VK_LOW_TEX") && !getenv("RX_VK_VRAM_MB") && budget > (896ull << 20)) {
         static int capped;
         if (!capped++)
-            logf("vk: texture budget capped at 1280 MB (low memory; RX_VK_VRAM_MB sets it, RX_VK_LOW_TEX=0 leaves the preset)");
-        budget = 1280ull << 20;
+            logf("vk: texture budget capped at 896 MB (low memory; RX_VK_VRAM_MB sets it, RX_VK_LOW_TEX=0 leaves the preset)");
+        budget = 896ull << 20;
     }
+    if (texture_squeeze() && budget > (640ull << 20)) budget = 640ull << 20;
     if (opts.vram_mb > 0 && known) {
         // Safety clamp: do not exceed 75% of driver-allowed memory on constrained VRAM (prevents VK_ERROR_DEVICE_LOST)
         budget = std::min(budget, (allowed / 4) * 3);
@@ -2773,8 +2803,8 @@ void texture_frame(uint64_t completed) {
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
         // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
         uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
-        if (low_mem_on("RX_VK_LOW_TEX") && !getenv("RX_VK_EVICT_RENDERED"))
-            keep_rendered = std::min(keep_rendered, (uint64_t)900);
+        // Rendered textures stay for the usual 3600 frames. Shortening that on the Deck evicted a target the
+        // character shader still sampled, and the one made again was empty: Link as a white silhouette.
         // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
         // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
         // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the

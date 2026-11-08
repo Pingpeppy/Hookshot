@@ -4094,7 +4094,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // (hookshot: left out by default. Waiting, Ocarina froze 0.2-3 s at each area's first new programs, the most reported stutter;
     // RX_VK_PIPE_SKIP=0: waited for, as mkw-recomp needs)
     static const bool always_wait = getenv("RX_VK_PIPE_SKIP") && atoi(getenv("RX_VK_PIPE_SKIP")) == 0;
-    const bool may_skip = !always_wait && targets_persistent(at);
+    // Low memory leaves a draw out instead of stalling the frame on a compile. RX_VK_PIPE_SKIP=0 still waits.
+    const bool may_skip = !always_wait && (targets_persistent(at) || low_mem_on("RX_VK_LOW_COMPILE"));
     auto wait_for = [&](const std::atomic<bool>& ready) {
         const auto t0 = std::chrono::steady_clock::now();
         jobs_wait(ready);
@@ -4998,7 +4999,8 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    const unsigned prepare_threads = low_mem_on("RX_VK_LOW_COMPILE") ? 1u : std::clamp(cpus / 2, 1u, 32u);
+    for (unsigned i = 0; i < prepare_threads; i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -5098,7 +5100,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
+    const unsigned pre_threads = low_mem_on("RX_VK_LOW_COMPILE") ? 1u : std::min(cpus, 64u);
+    for (unsigned i = 0; i < pre_threads; i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -5597,6 +5600,9 @@ void pipeline_cache_save(bool force) {
                 const std::string tmp = pcache_path + ".tmp";
                 if (FILE* f = fopen(tmp.c_str(), "wb")) {
                     const bool ok = fwrite(data.data(), 1, n, f) == n;
+#ifndef _WIN32
+                    posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
                     fclose(f);
                     if (ok) MoveFileExA(tmp.c_str(), pcache_path.c_str(), MOVEFILE_REPLACE_EXISTING);
                 }

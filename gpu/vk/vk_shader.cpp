@@ -792,10 +792,9 @@ struct DiskRecord { int64_t at; size_t size; uint32_t kind; };
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
-// Low memory maps the file and drops each payload's pages after the index (and after a load). The index is the
-// only thing kept. A 5.8 GB hookshot_programs.bin was otherwise read ahead into the page cache on an 11.7 GB APU.
-uint8_t* disk_map = nullptr;
-size_t disk_map_size = 0;
+// The index is the only thing kept. The 5.8 GB file is never mapped and never copied into the heap: a header
+// walk with POSIX_FADV_RANDOM, then DONTNEED. Writes are dropped from the page cache and synced every 32 MB so a
+// rebuild cannot pin gigabytes of dirty cache (that, plus the game's heap, is what earlyoom killed).
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 FILE* disk_out = nullptr;
 bool disk_listing = false;
@@ -842,60 +841,6 @@ void disk_init() {
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
         const uint64_t stamp = disk_stamp();
         int64_t good = 0, whole = 0;
-#ifndef _WIN32
-        if (low_mem_on("RX_VK_LOW_PROGRAMS")) {
-            const int fd = open(path.c_str(), O_RDONLY);
-            if (fd >= 0) {
-                struct stat st{};
-                if (fstat(fd, &st) == 0 && st.st_size >= 16) {
-                    void* mapped = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-                    if (mapped != MAP_FAILED) {
-                        posix_madvise(mapped, (size_t)st.st_size, POSIX_MADV_RANDOM);
-                        const auto* bytes = (const uint8_t*)mapped;
-                        uint32_t head[2]{};
-                        uint64_t kept = 0;
-                        std::memcpy(head, bytes, 8);
-                        std::memcpy(&kept, bytes + 8, 8);
-                        if (head[0] == kDiskMagic && kept == stamp) {
-                            good = 16;
-                            whole = st.st_size;
-                            while (good + 20 <= whole) {
-                                uint64_t rec[2];
-                                uint32_t kind = 0;
-                                std::memcpy(rec, bytes + good, 16);
-                                std::memcpy(&kind, bytes + good + 16, 4);
-                                if (good + 16 + (int64_t)rec[1] > whole) break;
-                                disk_records[rec[0]].push_back({good + 16, (size_t)rec[1], kind});
-                                if (rec[1] > (64u << 10)) {
-                                    const uintptr_t payload = (uintptr_t)(bytes + good + 16);
-                                    const uintptr_t start = (payload + 4095) & ~(uintptr_t)4095;
-                                    const uintptr_t end = (payload + rec[1]) & ~(uintptr_t)4095;
-                                    if (end > start) posix_madvise((void*)start, end - start, POSIX_MADV_DONTNEED);
-                                }
-                                good += 16 + (int64_t)rec[1];
-                            }
-                        }
-                        if (!good || good != whole) {
-                            munmap(mapped, (size_t)st.st_size);
-                            mapped = MAP_FAILED;
-                        }
-                        if (mapped != MAP_FAILED) {
-                            posix_madvise(mapped, (size_t)good, POSIX_MADV_DONTNEED);
-                            disk_map = (uint8_t*)mapped;
-                            disk_map_size = (size_t)good;
-                            logf("vk: program cache mapped (%lld MB on disk, index only; payloads not kept resident). RX_VK_LOW_PROGRAMS=0 reads it through stdio",
-                                 (long long)(good >> 20));
-                        }
-                    }
-                }
-                close(fd);
-            }
-        }
-        const bool indexed = good != 0;
-#else
-        const bool indexed = false;
-#endif
-        if (!indexed)
         if (FILE* f = fopen(path.c_str(), "rb")) {
             _fseeki64(f, 0, SEEK_END);
             whole = _ftelli64(f);
@@ -903,6 +848,9 @@ void disk_init() {
             uint32_t head[2]{};
             uint64_t kept = 0;
             if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == kDiskMagic && kept == stamp) {
+#ifndef _WIN32
+                posix_fadvise(fileno(f), 0, 0, POSIX_FADV_RANDOM);
+#endif
                 good = 16;
                 while (good + 20 <= whole) {
                     uint64_t rec[2];
@@ -911,34 +859,26 @@ void disk_init() {
                     if (fread(rec, 8, 2, f) != 2 || fread(&kind, 4, 1, f) != 1) break;
                     if (good + 16 + (int64_t)rec[1] > whole) break;   // (the run stopped while writing it)
                     disk_records[rec[0]].push_back({good + 16, (size_t)rec[1], kind});
+#ifndef _WIN32
+                    if (rec[1] > (64u << 10)) posix_fadvise(fileno(f), good + 16, (off_t)rec[1], POSIX_FADV_DONTNEED);
+#endif
                     good += 16 + (int64_t)rec[1];
                 }
             }
+#ifndef _WIN32
+            posix_fadvise(fileno(f), 0, 0, POSIX_FADV_DONTNEED);
+#endif
             fclose(f);
         }
         if (good) {
             if (good != whole) {   // (a record cut short: without it)
                 if (FILE* f = fopen(path.c_str(), "r+b")) _chsize_s(_fileno(f), good), fclose(f);
             }
-#ifndef _WIN32
-            if (!disk_map && low_mem_on("RX_VK_LOW_PROGRAMS")) {
-                const int fd = open(path.c_str(), O_RDONLY);
-                if (fd >= 0) {
-                    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-                    void* mapped = mmap(nullptr, (size_t)good, PROT_READ, MAP_PRIVATE, fd, 0);
-                    if (mapped != MAP_FAILED) {
-                        posix_madvise(mapped, (size_t)good, POSIX_MADV_DONTNEED);
-                        disk_map = (uint8_t*)mapped;
-                        disk_map_size = (size_t)good;
-                        logf("vk: program cache mapped (%lld MB on disk, index only; payloads not kept resident). RX_VK_LOW_PROGRAMS=0 reads it through stdio",
-                             (long long)(good >> 20));
-                    }
-                    close(fd);
-                }
-            }
-#endif
             disk_out = fopen(path.c_str(), "ab");
         } else {
+            if (whole > 16)
+                logf("vk: program cache stamp differs (%lld MB on disk): started empty. The old file is not read and not copied.",
+                     (long long)(whole >> 20));
             disk_out = fopen(path.c_str(), "wb");
             if (disk_out) {
                 const uint32_t h[2] = {kDiskMagic, 0};
@@ -949,7 +889,12 @@ void disk_init() {
         }
         disk_in = disk_out ? fopen(path.c_str(), "rb") : nullptr;
         disk_on = disk_out != nullptr && disk_in != nullptr;
-        logf("vk: program cache %s: %zu program keys kept, %lld KB", path.c_str(), disk_records.size(), (long long)(good >> 10));
+#ifndef _WIN32
+        if (disk_out) posix_fadvise(fileno(disk_out), 0, 0, POSIX_FADV_DONTNEED);
+        if (disk_in) posix_fadvise(fileno(disk_in), 0, 0, POSIX_FADV_DONTNEED);
+#endif
+        logf("vk: program cache %s: %zu program keys kept, %lld MB on disk, index only (payloads are not resident)",
+             path.c_str(), disk_records.size(), (long long)(good >> 20));
     });
 }
 
@@ -1045,6 +990,19 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fwrite(head, 8, 2, disk_out);
     fwrite(o.data(), 1, o.size(), disk_out);
     fflush(disk_out);
+#ifndef _WIN32
+    posix_fadvise(fileno(disk_out), at, (off_t)(16 + o.size()), POSIX_FADV_DONTNEED);
+    // Dirty pages of a multi-GB rewrite stay in RAM until they reach disk. Sync every 32 MB on a small machine.
+    if (low_mem_on("RX_VK_LOW_PROGRAMS")) {
+        static int64_t since_sync;
+        since_sync += (int64_t)o.size();
+        if (since_sync >= (32ll << 20)) {
+            fsync(fileno(disk_out));
+            posix_fadvise(fileno(disk_out), 0, 0, POSIX_FADV_DONTNEED);
+            since_sync = 0;
+        }
+    }
+#endif
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0))});
 }
@@ -1063,20 +1021,13 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
     }
     for (const DiskRecord& d : recs) {
         std::vector<uint8_t> data(d.size);
-        if (disk_map && d.at >= 0 && (uint64_t)d.at + d.size <= disk_map_size) {
-            std::memcpy(data.data(), disk_map + d.at, d.size);
-#ifndef _WIN32
-            if (d.size > (64u << 10)) {
-                const uintptr_t payload = (uintptr_t)(disk_map + d.at);
-                const uintptr_t start = (payload + 4095) & ~(uintptr_t)4095;
-                const uintptr_t end = (payload + d.size) & ~(uintptr_t)4095;
-                if (end > start) posix_madvise((void*)start, end - start, POSIX_MADV_DONTNEED);
-            }
-#endif
-        } else {
+        {
             std::lock_guard lk(disk_mu);
             _fseeki64(disk_in, d.at, SEEK_SET);
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
+#ifndef _WIN32
+            posix_fadvise(fileno(disk_in), d.at, (off_t)d.size, POSIX_FADV_DONTNEED);
+#endif
         }
         Reader r{data.data()};
         auto p = std::make_unique<Program>();
@@ -1698,8 +1649,11 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     std::vector<uint64_t> keys;
     {
         std::lock_guard lk(disk_mu);
+        // Low memory loads only the pipelines this save actually used. Every compute program in a 5.8 GB cache
+        // became a shader module at startup and stayed resident. RX_VK_LOW_PROGRAMS=0 loads them all again.
+        const bool all_compute = !low_mem_on("RX_VK_LOW_PROGRAMS");
         for (const auto& kv : disk_records)
-            if (wanted.count(kv.first) || (!kv.second.empty() && (kv.second[0].kind & 1))) keys.push_back(kv.first);
+            if (wanted.count(kv.first) || (all_compute && !kv.second.empty() && (kv.second[0].kind & 1))) keys.push_back(kv.first);
     }
     std::lock_guard lk(shader_mu);
     size_t n = 0;
@@ -1724,8 +1678,22 @@ struct SeedStage {
 };
 struct Seed {
     std::vector<uint8_t> blob;
+    uint8_t* mapped = nullptr;
+    size_t mapped_n = 0;
     std::vector<SeedStage> stages;
     std::vector<std::vector<uint32_t>> programs;
+    const uint8_t* bytes() const { return mapped ? mapped : blob.data(); }
+    size_t nbytes() const { return mapped ? mapped_n : blob.size(); }
+    void reset() {
+#ifndef _WIN32
+        if (mapped) munmap(mapped, mapped_n);
+#endif
+        mapped = nullptr;
+        mapped_n = 0;
+        blob.clear();
+        stages.clear();
+        programs.clear();
+    }
 } seed;
 std::string beside_exe(const char* name) {
     char exe[MAX_PATH];
@@ -1734,15 +1702,38 @@ std::string beside_exe(const char* name) {
     return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
 }
 Code stage_of_seed(const SeedStage& st) {
-    return parse_code(seed.blob.data() + st.control, std::vector<uint8_t>(seed.blob.begin() + (ptrdiff_t)st.code,
-                                                                          seed.blob.begin() + (ptrdiff_t)st.code + st.end));
+    const uint8_t* b = seed.bytes();
+    return parse_code(b + st.control, std::vector<uint8_t>(b + st.code, b + st.code + st.end));
 }
 } // namespace
 
 std::string seed_path() { return beside_exe("hookshot_shaders.bin"); }
 
 size_t seed_open() {
-    if (FILE* f = fopen(seed_path().c_str(), "rb")) {
+    const std::string path = seed_path();
+#ifndef _WIN32
+    if (low_mem_on("RX_VK_LOW_PROGRAMS")) {
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st{};
+            if (fstat(fd, &st) == 0 && st.st_size >= 16) {
+                void* m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    posix_madvise(m, (size_t)st.st_size, POSIX_MADV_RANDOM);
+                    if (std::memcmp(m, "HKSEED01", 8) == 0) {
+                        seed.mapped = (uint8_t*)m;
+                        seed.mapped_n = (size_t)st.st_size;
+                        logf("vk: shader seed mapped (%lld MB), not copied into the heap. RX_VK_LOW_PROGRAMS=0 reads it in",
+                             (long long)(st.st_size >> 20));
+                    } else munmap(m, (size_t)st.st_size);
+                }
+            }
+            close(fd);
+        }
+    }
+#endif
+    if (!seed.mapped)
+    if (FILE* f = fopen(path.c_str(), "rb")) {
         _fseeki64(f, 0, SEEK_END);
         seed.blob.resize((size_t)_ftelli64(f));
         _fseeki64(f, 0, SEEK_SET);
@@ -1751,39 +1742,40 @@ size_t seed_open() {
             seed.blob.clear();
         fclose(f);
     }
-    if (seed.blob.empty()) return 0;
+    if (!seed.nbytes()) return 0;
     disk_init();
     disk_listing = true;
     size_t at = 16;
-    const uint32_t nprograms = *(uint32_t*)(seed.blob.data() + 8), nstages = *(uint32_t*)(seed.blob.data() + 12);
+    const uint8_t* base = seed.bytes();
+    const uint32_t nprograms = *(uint32_t*)(base + 8), nstages = *(uint32_t*)(base + 12);
     seed.stages.resize(nstages);
     for (SeedStage& st : seed.stages) {
-        const uint8_t* h = seed.blob.data() + at;
+        const uint8_t* h = base + at;
         const uint32_t csize = *(uint32_t*)(h + 12), bytes = *(uint32_t*)(h + 16);
         st.stage = *(uint32_t*)(h + 8);
         st.control = at + 20;
         st.code = st.control + csize;
         at = st.code + bytes;
-        if (at > seed.blob.size()) return seed.blob.clear(), seed.stages.clear(), 0;
-        if (csize < kControlSize || !control_end(seed.blob.data() + st.control, &st.end) || st.end > bytes) {
+        if (at > seed.nbytes()) return seed.reset(), 0;
+        if (csize < kControlSize || !control_end(base + st.control, &st.end) || st.end > bytes) {
             st.end = 0;   // (not one this game's programs can be)
             continue;
         }
-        st.key = code_key(seed.blob.data() + st.control, seed.blob.data() + st.code, st.end);
+        st.key = code_key(base + st.control, base + st.code, st.end);
         seed_keys.insert(st.key);
-        std::memcpy(st.sph, seed.blob.data() + st.code, std::min<size_t>(sizeof st.sph, st.end));
+        std::memcpy(st.sph, base + st.code, std::min<size_t>(sizeof st.sph, st.end));
     }
     seed.programs.resize(nprograms);
     for (auto& list : seed.programs) {
-        const uint32_t n = *(uint32_t*)(seed.blob.data() + at);
-        list.assign((uint32_t*)(seed.blob.data() + at + 4), (uint32_t*)(seed.blob.data() + at + 4) + n);
+        const uint32_t n = *(uint32_t*)(base + at);
+        list.assign((uint32_t*)(base + at + 4), (uint32_t*)(base + at + 4) + n);
         at += 4 + n * 4;
     }
     return seed.programs.size();
 }
 
 void seed_close() {
-    seed = Seed{};
+    seed.reset();
     disk_listing = false;
 }
 
@@ -1858,9 +1850,20 @@ const Program* program_find(uint64_t key, uint64_t variant) {
     return nullptr;
 }
 
+void program_cache_reclaim() {
+#ifndef _WIN32
+    std::lock_guard lk(disk_mu);
+    if (disk_out) posix_fadvise(fileno(disk_out), 0, 0, POSIX_FADV_DONTNEED);
+    if (disk_in) posix_fadvise(fileno(disk_in), 0, 0, POSIX_FADV_DONTNEED);
+#endif
+}
+
 void shader_stats(int64_t* translated, int64_t* failed) {
     static int64_t hits_logged;
-    if (st_cache_hits.load() >= hits_logged + 500) logf("vk: %lld programs from the program cache", (long long)(hits_logged = st_cache_hits.load()));
+    const int64_t hits = st_cache_hits.load();
+    if (hits >= hits_logged + 200 || (low_mem_mode() && hits != hits_logged && hits % 50 == 0))
+        logf("vk: program cache hits %lld, translated this run %lld (a miss is a compile)",
+             (long long)(hits_logged = hits), (long long)st_translated.load());
     *translated = st_translated, *failed = st_failed;
 }
 double shader_translate_ms() {

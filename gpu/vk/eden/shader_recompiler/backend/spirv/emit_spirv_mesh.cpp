@@ -19,14 +19,17 @@
 
 namespace Shader::Backend::SPIRV {
 namespace {
-void Barrier(EmitContext& ctx) {
+void Barrier(EmitContext& ctx, bool payload) {
     // WorkgroupMemory covers the mesh stage buffer in workgroup memory. The task payload is
     // TaskPayloadWorkgroupEXT, which SPIR-V publishes with Output memory. Without that bit the
     // count each lane loads is not the same, OpEmitMeshTasksEXT is undefined, and RADV's gfx
-    // ring never retires (no page fault). RX_VK_MESH_PAYLOAD_BARRIER gates the bit; it is on for RADV.
+    // ring never retires (no page fault). The same bit on a mesh-stage barrier made RADV treat
+    // the mesh outputs as the thing being published, and the workgroup stores of the character
+    // mesh were not visible yet: Link came out a white silhouette with streaks. Output memory is
+    // only for the task payload. RX_VK_MESH_PAYLOAD_BARRIER gates that bit; it is on for RADV.
     u32 semantics = static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease) |
                     static_cast<u32>(spv::MemorySemanticsMask::WorkgroupMemory);
-    if (ctx.profile.mesh_payload_output_memory)
+    if (payload && ctx.profile.mesh_payload_output_memory)
         semantics |= 0x1000u; // MemorySemanticsOutputMemoryMask
     ctx.OpControlBarrier(ctx.Const(static_cast<u32>(spv::Scope::Workgroup)),
                          ctx.Const(static_cast<u32>(spv::Scope::Workgroup)),
@@ -122,7 +125,7 @@ u32 task_cap(u32 threads) {   // (RX_VK_TASK_CAP=<n>: mesh workgroups a task may
 }
 
 void TaskEpilogue(EmitContext& ctx) {
-    Barrier(ctx);
+    Barrier(ctx, true);
     // (hookshot) at most one mesh workgroup a task thread: each thread keeps or culls one meshlet (the programs compact them by subgroup
     // ballot). It was 65535, and a payload word a task left unwritten is anything: when the task culled everything, tens of thousands of
     // mesh workgroups for a draw held the GPU past Windows' two seconds, and the device was lost, on about half the first starts
@@ -137,7 +140,7 @@ void TaskEpilogue(EmitContext& ctx) {
 
 void MeshEpilogue(EmitContext& ctx) {
     const MeshInfo& mesh{ctx.mesh_info};
-    Barrier(ctx);
+    Barrier(ctx, false);
     const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
                               ctx.Const(mesh.max_primitives))};
     const Id max_vertices{ctx.Const(mesh.max_vertices)};
@@ -247,7 +250,7 @@ void EmitMeshPrologue(EmitContext& ctx) {
         // (hookshot) the count starts at nothing: task payload memory holds whatever the last task left, and a task that keeps no meshlet
         // never writes it. The barrier: every thread has done this before any of them goes on to write the real count
         ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
-        Barrier(ctx);
+        Barrier(ctx, true);
     }
     if (ctx.stage != Stage::Mesh) {
         return;
@@ -276,7 +279,7 @@ void EmitMeshPrologue(EmitContext& ctx) {
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
-    Barrier(ctx);
+    Barrier(ctx, false);
 }
 
 void EmitMeshEpilogue(EmitContext& ctx) {
