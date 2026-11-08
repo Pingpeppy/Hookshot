@@ -1956,7 +1956,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written.push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw.imgs.size(), handle, view ? tex : nullptr);
-                if (!view && !dev.null_descriptor) view = VK_NULL_HANDLE;
+                if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 dw.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw.imgs[first];
@@ -2600,7 +2600,69 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
 #undef DYN_CHANGED
 
 void make_dummies() {
-    if (dummies.view[0] || dev.null_descriptor) return;
+    // A null VkImageView in a descriptor faults RADV (libvulkan_radeon dereferences it) even when
+    // nullDescriptor is on. These stand in for a view that was not created. nullDescriptor stays the
+    // path for buffers.
+    if (dummies.view[VK_IMAGE_VIEW_TYPE_2D] || !rec_cmd) return;
+    struct Img {
+        VkImageType type;
+        uint32_t layers;
+        VkImageCreateFlags flags;
+        VkImage image;
+        VmaAllocation alloc;
+    };
+    static Img imgs[3] = {
+        {VK_IMAGE_TYPE_1D, 1, 0, VK_NULL_HANDLE, nullptr},
+        {VK_IMAGE_TYPE_2D, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, VK_NULL_HANDLE, nullptr},
+        {VK_IMAGE_TYPE_3D, 1, 0, VK_NULL_HANDLE, nullptr},
+    };
+    for (Img& im : imgs) {
+        if (im.image) continue;
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.flags = im.flags;
+        ci.imageType = im.type;
+        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ci.extent = {1, 1, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = im.type == VK_IMAGE_TYPE_3D ? 1u : im.layers;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!create_image(ci, im.image, im.alloc)) return;
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = im.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(rec_cmd, &di);
+    }
+    auto mk = [](VkImageViewType type, Img& im, uint32_t layers) {
+        VkImageViewUsageCreateInfo uci{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.pNext = &uci;
+        vi.image = im.image;
+        vi.viewType = type;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        VkImageView v = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev.device, &vi, nullptr, &v) != VK_SUCCESS) return;
+        dummies.view[(int)type] = v;
+    };
+    mk(VK_IMAGE_VIEW_TYPE_1D, imgs[0], 1);
+    mk(VK_IMAGE_VIEW_TYPE_1D_ARRAY, imgs[0], 1);
+    mk(VK_IMAGE_VIEW_TYPE_2D, imgs[1], 1);
+    mk(VK_IMAGE_VIEW_TYPE_2D_ARRAY, imgs[1], 6);
+    mk(VK_IMAGE_VIEW_TYPE_CUBE, imgs[1], 6);
+    mk(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, imgs[1], 6);
+    mk(VK_IMAGE_VIEW_TYPE_3D, imgs[2], 1);
+    logf("vk: a view that cannot be made is a 1x1 dummy image. A null image view faults RADV");
 }
 
 

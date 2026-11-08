@@ -32,6 +32,8 @@ def main():
         raise SystemExit("hos_main.c: Deck profile is missing")
     if "RX_VK_DECK=0" not in MAIN:
         raise SystemExit("hos_main.c: RX_VK_DECK=0 must turn the profile off")
+    if "null image view faults RADV" not in DRAW or "dummies.view[(int)vt]" not in DRAW:
+        raise SystemExit("vk_draw.cpp: a view that was not made must be a dummy, not a null handle")
     print("radv mesh optimizer, payload barrier and deck profile ok")
 
 
