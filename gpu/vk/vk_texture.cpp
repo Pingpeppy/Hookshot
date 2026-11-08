@@ -165,6 +165,7 @@ struct KeyHash {
 std::unordered_map<Key, std::unique_ptr<Texture>, KeyHash> textures;
 std::unordered_multimap<uint64_t, Texture*> by_gpu;
 uint64_t frame_no = 1;
+uint64_t born_ring[300]{};   // (bytes of textures made in that present: the scene-change detector)
 uint64_t total_bytes = 0;
 // Eviction age in wall-clock milliseconds, not presents. On a device at 4 fps, "unused for 60 presents" is 15 seconds,
 // and VRAM ran over the driver's budget between sweeps (RufflezAU, Deck: textures past a 2 GB budget, then RADV paged
@@ -1713,6 +1714,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
+    born_ring[frame_no % 300] += x.bytes + x.pad;
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -2887,6 +2889,7 @@ Texture* texture_for_present(const nvn_tex* t) {
 void texture_frame(uint64_t completed) {
     completed_value = completed;
     frame_no++;
+    born_ring[frame_no % 300] = 0;
     uint64_t kept = 0;
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
@@ -3163,9 +3166,26 @@ void texture_frame(uint64_t completed) {
              verify_dim().second, checked, changed, missed);
     }
     static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
+    static const bool scene_off = getenv("RX_VK_SCENE_PURGE") && getenv("RX_VK_SCENE_PURGE")[0] == '0';
+    bool scene_now = false;
+    static bool bursting = false;
+    static uint64_t burst_at = 0;
+    if (low_mem_on(nullptr) && !scene_off) {
+        uint64_t sum300 = 0, sum90 = 0;
+        for (uint32_t i = 0; i < 300 && frame_no >= i; i++) {
+            const uint64_t b = born_ring[(frame_no - i) % 300];
+            sum300 += b;
+            if (i < 90) sum90 += b;
+        }
+        if (!bursting && sum300 >= (256ull << 20)) {
+            bursting = true;
+            burst_at = frame_no > 300 ? frame_no - 300 : 1;
+        }
+        if (bursting && frame_no > burst_at + 90 && sum90 < (8ull << 20)) scene_now = true;
+    }
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
     const bool sweep = total_bytes <= budget;
-    if (no_evict || (sweep && frame_no % 600)) return;
+    if (!scene_now && (no_evict || (sweep && frame_no % 600))) return;
     std::vector<std::pair<uint64_t, Texture*>> order;
     order.reserve(textures.size());
     for (auto& kv : textures) order.push_back({kv.second->last_ms, kv.second.get()});
@@ -3181,8 +3201,19 @@ void texture_frame(uint64_t completed) {
         getenv("RX_VK_EVICT_MIN_PRESENTS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_PRESENTS"))) : 90;
     const uint64_t unused_ms = press.level >= 2 ? std::min<uint64_t>(min_unused_ms, 250) : min_unused_ms;
     const uint64_t now_ms = tex_now_ms();
+    uint64_t scene_bytes = 0;
+    size_t scene_n = 0;
+    uint64_t heap_before = 0;
+    if (scene_now) {
+        uint64_t blocks = 0, alloc = 0, free_b = 0, sys_u = 0, sys_b = 0, sys_a = 0;
+        vma_heap_account(&heap_before, &blocks, &alloc, &free_b, &sys_u, &sys_b, &sys_a);
+    }
     for (auto& [last, tex] : order) {
+        const bool baked = tex->first_written && tex->first_written == tex->last_written && tex->bytes <= (4ull << 20);
         bool overwritten = false;
+        if (scene_now) {
+            if (tex->last_frame >= burst_at || tex->last_value > completed || baked) continue;
+        } else {
         if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
         if (ws_on && frame_no - tex->last_frame < min_presents) break;
         if (tex->last_value > completed) continue;
@@ -3219,8 +3250,8 @@ void texture_frame(uint64_t completed) {
         // went after a minute unused, and the one made again over storage only the GPU had written stayed empty: the
         // pause blur black. Not a finalized one: the transient targets the game makes and finalizes every frame are
         // each "written in one frame", and kept so they added up, ~20 MB a minute)
-        const bool baked = tex->first_written && tex->first_written == tex->last_written && tex->bytes <= (4ull << 20);
         if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && baked) continue;
+        } // (the ordinary eviction. A scene pass skips those keeps: the old scene goes, baked tables stay)
         // (a texture the GPU drew that still holds the game's content goes into the game's memory first: made again later, it is
         // uploaded from there with what the GPU drew. Evicted without it, it came back empty or stale: a terrain chunk dark, a
         // tiled pattern over the Deku Tree's planks and Hyrule Field's path, with a 16 GB card's textures at the 6 GB budget
@@ -3238,6 +3269,7 @@ void texture_frame(uint64_t completed) {
             evicted_at[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = {frame_no, tex->gpu_written};
             remade.erase(tex);
         }
+        if (scene_now) scene_n++, scene_bytes += tex->bytes;
         destroy_later(*tex);
         forget_gpu(tex);
         gone.push_back(tex);
@@ -3253,6 +3285,25 @@ void texture_frame(uint64_t completed) {
     }
     const size_t n = order.size() - textures.size();
     if (n) logf("vk: %zu textures retired (%zu left, %llu MB)", n, textures.size(), (unsigned long long)(total_bytes >> 20));
+    if (scene_now) {
+        bursting = false;
+        for (auto it = arenas.begin(); it != arenas.end();) {
+            if (it->value <= completed && it->value != rec_value) {
+                destroy_buffer(it->buffer, it->allocation);
+                it = arenas.erase(it);
+            } else ++it;
+        }
+        bc_scratch_idle(true);
+        memory_scene_release();
+#if defined(__linux__) && defined(__GLIBC__)
+        jobs_push([] { malloc_trim(0); });
+#endif
+        uint64_t heap_after = 0, blocks = 0, alloc = 0, free_b = 0, sys_u = 0, sys_b = 0, sys_a = 0;
+        vma_heap_account(&heap_after, &blocks, &alloc, &free_b, &sys_u, &sys_b, &sys_a);
+        logf("vk: scene settled after %llu presents: %zu textures (%llu MB) left out; heap 1 %llu → %llu MB",
+             (unsigned long long)(frame_no - burst_at), scene_n, (unsigned long long)(scene_bytes >> 20),
+             (unsigned long long)(heap_before >> 20), (unsigned long long)(heap_after >> 20));
+    }
 }
 
 void texture_log_guest(const Texture* t) {

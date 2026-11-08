@@ -266,6 +266,7 @@ void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 uint64_t pipeline_count();
 uint64_t program_count();
 /// Imported guest bytes, capture buffers and shadow pages (the Deck memory line)
+void memory_scene_release();
 void memory_host_account(uint64_t* import_bytes, uint64_t* cap_n, uint64_t* cap_bytes, uint64_t* spare_n,
                          uint64_t* spare_bytes, uint64_t* shadow_pages);
 /// Numbers the present thread already has. deck_memlog_emit reads /proc on a worker and prints the three lines.

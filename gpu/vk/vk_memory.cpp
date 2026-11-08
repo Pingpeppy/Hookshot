@@ -2523,6 +2523,51 @@ void imports_give_back() {   // (pools_mu held)
              (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
 }
 
+void memory_scene_release() {
+    {
+        std::lock_guard lk(cap_free_mu);
+        for (const FreeBuf& b : cap_free) destroy_buffer(b.buffer, b.alloc);
+        cap_free.clear();
+        cap_free_bytes = 0;
+    }
+    std::lock_guard lk(pools_mu);
+    const char* env_high = getenv("RX_VK_IMPORT_HIGH");
+    if (env_high && atoi(env_high) == 0) return;
+    const int high = 60;
+    const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 50;
+    uint64_t used = 0, budget = 0;
+    if (!system_heap_usage(&used, &budget) || used <= budget / 100 * (uint64_t)high) return;
+    const uint64_t target = budget / 100 * (uint64_t)low;
+    const uint64_t want = used > target ? used - target : 0;
+    std::vector<std::map<uint64_t, Pool>::iterator> idle;
+    for (auto it = imported.begin(); it != imported.end(); ++it) {
+        const Pool& p = it->second;
+        if ((p.mstate == Pool::MIRROR_NONE || p.mstate == Pool::MIRROR_REFUSED) && p.last_value <= mem_completed &&
+            mem_rec_value > p.last_value + kImportIdle)
+            idle.push_back(it);
+    }
+    std::sort(idle.begin(), idle.end(), [](auto a, auto b) { return a->second.last_value < b->second.last_value; });
+    uint64_t freed = 0;
+    int n = 0;
+    for (auto it : idle) {
+        if (freed >= want) break;
+        Pool& p = it->second;
+        guest_pages_set(p.lo, p.hi, 0);
+        p.retired_value = mem_rec_value;
+        freed += p.hi - p.lo;
+        n++;
+        evicted_pools.push_back(imported.extract(it));
+    }
+    if (!n) return;
+    pools_gen++;
+    last_pool = nullptr;
+    std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
+    if (mirror_on()) publish_cap_ranges();
+    st_imports_evicted += n, st_import_bytes_evicted += freed;
+    logf("vk: scene: system heap %llu of %llu MB: %d idle imports given back (%llu MB)",
+         (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20));
+}
+
 void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
     reap_mirrors();
