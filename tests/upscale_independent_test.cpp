@@ -66,6 +66,13 @@ int vkCreateSampler(int, const VkSamplerCreateInfo* s, void*, VkSampler* out) {
     CHECK(s->magFilter == VK_FILTER_LINEAR && s->minFilter == VK_FILTER_LINEAR);
     ++sampler_calls; *out = sampler_fail ? 0 : 4; return sampler_fail ? -1 : VK_SUCCESS;
 }
+struct PipelineCreateLock {
+    int held = 0;
+    PipelineCreateLock() { held = 1; }
+    ~PipelineCreateLock() { held = 0; }
+    PipelineCreateLock(const PipelineCreateLock&) = delete;
+    PipelineCreateLock& operator=(const PipelineCreateLock&) = delete;
+};
 void vkDestroyPipeline(int, uint64_t, void*) { ++destroyed_pipes; }
 void vkDestroyPipelineLayout(int, uint64_t, void*) { ++destroyed_layouts; }
 void vkDestroyDescriptorSetLayout(int, uint64_t, void*) { ++destroyed_sets; }
