@@ -520,6 +520,59 @@ static int game_main(int argc, char **argv) {
 }
 
 #ifndef _WIN32
+#include <dirent.h>
+/* Steam Deck (LCD Jupiter, OLED Galileo) and any Van Gogh (PCI 1002:163f). The opening scene's task/mesh draws
+   hang RADV on this APU; the renderer keeps the driver optimizer and the payload barrier for every RADV GPU.
+   Here, before the game reads them: no occlusion queries, no frame generation, a 45 fps present cap (90 Hz / 2).
+   RX_VK_DECK=0 skips this. A value already in the environment or hookshot_env.txt is left as it is. */
+static int valve_deck(void) {
+    const char *e = getenv("RX_VK_DECK");
+    if (e) return e[0] != '0';
+    FILE *f = fopen("/sys/class/dmi/id/product_name", "r");
+    char name[64];
+    if (f) {
+        if (fgets(name, sizeof name, f) &&
+            (strstr(name, "Galileo") || strstr(name, "Jupiter") || strstr(name, "Steam Deck"))) {
+            fclose(f);
+            return 1;
+        }
+        fclose(f);
+    }
+    DIR *d = opendir("/sys/bus/pci/devices");
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        char path[320];
+        if (ent->d_name[0] == '.') continue;
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/vendor", ent->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        unsigned vendor = 0, device = 0;
+        if (fscanf(f, "%x", &vendor) != 1) vendor = 0;
+        fclose(f);
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/device", ent->d_name);
+        f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%x", &device) != 1) device = 0;
+            fclose(f);
+        }
+        if (vendor == 0x1002 && device == 0x163f) {
+            closedir(d);
+            return 1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+static void deck_profile(void) {
+    if (!valve_deck()) return;
+    if (!getenv("HOOKSHOT_OCCLUSION_OFF")) setenv("HOOKSHOT_OCCLUSION_OFF", "1", 0);
+    if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
+    if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
+    if (!getenv("RX_VK_DECK")) setenv("RX_VK_DECK", "1", 0);
+    fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap). "
+                    "RX_VK_DECK=0 turns the profile off.\n");
+}
 /* (linux) The window belongs on the process's main thread (SDL), so the game runs on a thread of its own, with the
    stack the guest main thread's lifted code needs (the main thread has the system's 8 MB): host/posix/display_sdl.c */
 static int game_argc;
@@ -532,6 +585,7 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+    deck_profile();
     game_argc = argc, game_argv = argv;
     const int window = hos_display_init();
     HANDLE t = CreateThread(NULL, 64u << 20, game_thread, NULL, 0, NULL);

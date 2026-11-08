@@ -20,10 +20,17 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 void Barrier(EmitContext& ctx) {
+    // WorkgroupMemory covers the mesh stage buffer in workgroup memory. The task payload is
+    // TaskPayloadWorkgroupEXT, which SPIR-V publishes with Output memory. Without that bit the
+    // count each lane loads is not the same, OpEmitMeshTasksEXT is undefined, and RADV's gfx
+    // ring never retires (no page fault). RX_VK_MESH_PAYLOAD_BARRIER gates the bit; it is on for RADV.
+    u32 semantics = static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease) |
+                    static_cast<u32>(spv::MemorySemanticsMask::WorkgroupMemory);
+    if (ctx.profile.mesh_payload_output_memory)
+        semantics |= 0x1000u; // MemorySemanticsOutputMemoryMask
     ctx.OpControlBarrier(ctx.Const(static_cast<u32>(spv::Scope::Workgroup)),
                          ctx.Const(static_cast<u32>(spv::Scope::Workgroup)),
-                         ctx.Const(static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease |
-                                                    spv::MemorySemanticsMask::WorkgroupMemory)));
+                         ctx.Const(semantics));
 }
 
 Id LocalInvocation(EmitContext& ctx) {

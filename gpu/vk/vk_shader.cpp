@@ -460,6 +460,7 @@ Shader::Profile make_profile() {
     p.need_declared_frag_colors = false;
     p.max_subgroup_size = 32;
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.mesh_payload_output_memory = radv_mesh_payload_barrier();
     return p;
 }
 

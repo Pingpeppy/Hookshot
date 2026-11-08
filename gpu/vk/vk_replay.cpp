@@ -16,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -2746,10 +2747,24 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         log_frame_stats();
     }
     if (dev.offscreen || interpolated) return;
+    pace_fps_cap();
     present_image(src, sw, sh, crop, direct_view);
 }
 
 } // namespace
+
+void pace_fps_cap() {
+    static const int cap = getenv("RX_VK_FPS_CAP") ? std::atoi(getenv("RX_VK_FPS_CAP")) : 0;
+    if (cap < 15 || cap > 240) return;
+    using clock = std::chrono::steady_clock;
+    static clock::time_point next{};
+    const auto step = std::chrono::nanoseconds(1000000000LL / cap);
+    const auto now = clock::now();
+    if (next.time_since_epoch().count() != 0 && now < next)
+        std::this_thread::sleep_until(next);
+    const auto after = clock::now();
+    next = (next.time_since_epoch().count() == 0 || after > next + step) ? after + step : next + step;
+}
 
 // (hookshot) RX_VK_FRAMELOG=<file>: every frame shown, the game's and the made ones, as they go to the screen, 320x180, while
 // <file>.go exists (scripts/framelog.py finds the flashes). Taken at the last step and written on a thread of its own, so

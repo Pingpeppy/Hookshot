@@ -581,7 +581,16 @@ void menu_init() {
         if (!v2) opts.realtime = 1;
     }
     if (opts.preset > 0) sync_preset_budgets(opts.preset);
+    // Steam Deck OLED is a 15 W APU at 1280x800. Auto resolution stays at the game's docked size, and 2x frame
+    // generation spends the same GPU on made frames. The profile (hos_main.c / vk_main.cpp) sets RX_VK_DECK.
+    // RX_VK_KEEP_RES=1 leaves Auto alone. RX_VK_FRAMEGEN in the environment still wins below.
+    if (const char* deck = getenv("RX_VK_DECK"); deck && deck[0] != '0' && !getenv("RX_VK_KEEP_RES") && opts.resolution == 0)
+        opts.resolution = 4;
     if (opts.framegen == 1) opts.framegen = 2;
+    if (const char* e = getenv("RX_VK_FRAMEGEN")) {
+        const int v = atoi(e);
+        opts.framegen = v <= 1 ? 0 : std::min(std::max(v, 2), 8);
+    }
     if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 8);
     if (const char* e = getenv("RX_VK_PACE")) opts.pace = atoi(e) != 0;
     if (const char* e = getenv("RX_VK_UPSCALE"))

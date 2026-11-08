@@ -28,6 +28,10 @@ extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
+bool radv_driver();          // (Mesa RADV; false until the device exists)
+/// Output-memory semantics on task payload barriers. On for RADV unless RX_VK_MESH_PAYLOAD_BARRIER=0.
+bool radv_mesh_payload_barrier();
+void pace_fps_cap();         // (RX_VK_FPS_CAP: do not present faster than this)
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;

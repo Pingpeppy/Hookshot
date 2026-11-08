@@ -6,6 +6,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -521,6 +522,26 @@ MkwVkRenderer table;
 } // namespace
 } // namespace mkwvk
 
+namespace mkwvk {
+bool radv_driver() {
+    static const int id = [] {
+        if (!dev.physical) return 0;
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        return (int)dp.driverID;
+    }();
+    return id == VK_DRIVER_ID_MESA_RADV;
+}
+
+bool radv_mesh_payload_barrier() {
+    const char* e = getenv("RX_VK_MESH_PAYLOAD_BARRIER");
+    if (e && e[0]) return std::atoi(e) != 0;
+    return radv_driver();
+}
+} // namespace mkwvk
+
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -540,6 +561,21 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
+    if (radv_driver()) {
+        const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH") ||
+                             std::strstr(dev.props.deviceName, "0932");
+        logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
+             vangogh ? " on Van Gogh" : "");
+        if (vangogh && !getenv("RX_VK_DECK")) {
+#ifndef _WIN32
+            setenv("RX_VK_DECK", "1", 0);
+            if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
+            if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
+#endif
+            logf("vk: Steam Deck profile (Van Gogh): frame generation off, present cap 45 fps. "
+                 "RX_VK_DECK=0 leaves the Insert menu as it is. Occlusion queries: HOOKSHOT_OCCLUSION_OFF=1");
+        }
+    }
     if (!dev.mesh_shader && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
         // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on)

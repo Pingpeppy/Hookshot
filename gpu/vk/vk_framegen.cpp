@@ -316,6 +316,7 @@ void display_main() {
             while (now_ns() < due) SwitchToThread();
             const int64_t t = now_ns();
             present_kind.store(k < j.set->made ? 1 : 0);
+            pace_fps_cap();
             present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
             menu_note_frame(k == j.set->made);
             if (shown_at) {

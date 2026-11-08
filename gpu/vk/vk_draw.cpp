@@ -1060,24 +1060,35 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // (-13 here) or takes minutes on some Ocarina shaders it builds in seconds unoptimized (Lichii #200, #210).
         static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
         if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        // (from PR 430, YunaraDebugs: on AMD the task and mesh programs (OoT's foliage culling, following pointers through its
-        // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
-        // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
-        // without it on AMD. RX_VK_MESH_OPT=1: with it, as the others)
+        // (from PR 430, YunaraDebugs: on AMD's proprietary compiler the task and mesh programs (OoT's foliage culling,
+        // following pointers through its tables) hung the GPU when that compiler optimized them: a device lost one to
+        // four minutes into Kokiri (RX 6600, issues 461 and 484). They stay unoptimized on that compiler.
+        // Mesa RADV is the other way around: the same unoptimized task/mesh programs never finish (gfx ring timeout,
+        // no page fault, Steam Deck OLED / RX 6800 XT). RADV keeps the driver's optimizer. RX_VK_MESH_OPT=0 forces it
+        // off, RX_VK_MESH_OPT=1 forces it on, on any GPU.)
         static const bool amd = [] {
             VkPhysicalDeviceProperties pr{};
             vkGetPhysicalDeviceProperties(dev.physical, &pr);
             return pr.vendorID == 0x1002;
         }();
-        static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
-        if (amd && !mesh_opt) {
-            bool mesh = false;
-            for (const Stage& st : p.stages) mesh |= (st.vk_stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
-            if (mesh) {
-                ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-                static std::atomic<int> told{0};
-                if (told++ < 1) logf("vk: task and mesh programs built without the driver's optimizer (AMD; RX_VK_MESH_OPT=1: with it)");
-            }
+        static const int mesh_opt = [] {
+            const char* e = getenv("RX_VK_MESH_OPT");
+            if (!e || !e[0]) return -1;
+            return std::atoi(e) != 0 ? 1 : 0;
+        }();
+        bool mesh = false;
+        for (const Stage& st : p.stages) mesh |= (st.vk_stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
+        const bool radv = radv_driver();
+        const bool disable_mesh = mesh && (mesh_opt == 0 || (mesh_opt < 0 && amd && !radv));
+        if (disable_mesh) {
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            static std::atomic<int> told{0};
+            if (told++ < 1)
+                logf("vk: task and mesh programs built without the driver's optimizer (AMD proprietary; RX_VK_MESH_OPT=1: with it)");
+        } else if (mesh && radv && !noopt) {
+            static std::atomic<int> told{0};
+            if (told++ < 1)
+                logf("vk: task and mesh programs use the driver's optimizer (RADV; RX_VK_MESH_OPT=0: without it)");
         }
     }
     const VkResult r = guarded_graphics(part >= 0 ? VK_NULL_HANDLE : pcache, &ci, &pl);
@@ -4386,7 +4397,16 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 const uint64_t firsts = mesh_args_address + (uint64_t)at * 16 + 12;
                 vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, 8, &firsts);
             }
-            vkCmdDrawMeshTasksEXT(cmd, (uint32_t)std::max(d.groups[0], 0), (uint32_t)std::max(d.groups[1], 1),
+            uint32_t groups = (uint32_t)std::max(d.groups[0], 0);
+            // A runaway task count (a broken indirect rewrite or a garbage direct count) keeps the gfx ring busy until
+            // amdgpu resets it. Real draws are far under this. RADV only, so a desktop GPU is unchanged.
+            if (groups > 262144u && radv_driver()) {
+                static std::atomic<int> told{0};
+                if (told++ < 8)
+                    logf("vk: mesh draw of %u task groups clamped to 262144 (RADV)", groups);
+                groups = 262144u;
+            }
+            vkCmdDrawMeshTasksEXT(cmd, groups, (uint32_t)std::max(d.groups[1], 1),
                                   (uint32_t)std::max(d.groups[2], 1));
         }
         st_mesh++;
