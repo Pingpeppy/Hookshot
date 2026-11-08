@@ -804,6 +804,14 @@ std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
 constexpr size_t kKeep = 24;
 constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
+uint64_t cap_bytes_max() {
+    // (Deck / low-memory: 128 MB. RX_VK_CAP_MAX_MB=<n> overrides, 0 keeps this rule)
+    if (const char* e = getenv("RX_VK_CAP_MAX_MB")) {
+        if (e[0] && atoll(e)) return (uint64_t)atoll(e) << 20;
+    }
+    if (low_mem_on(nullptr)) return 128ull << 20;
+    return kCapBytesMax;
+}
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
 struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; };
 std::vector<FreeBuf> cap_free;
@@ -818,12 +826,11 @@ uint64_t cap_free_bytes = 0;   // (cap_free_mu)
 // (the spare buffers: 12 and, on a card of 6 GB or less, 32 MB of them; RX_VK_CAP_SPARE_MB=<n>: that many, 0: as before.
 // After a load the retired ones, 40-60 MB each, stayed as spares for good)
 uint64_t cap_spare_max() {
-    static const uint64_t v = [] {
-        if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
-        uint64_t used = 0, allowed = 0;
-        return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : ~0ull;
-    }();
-    return v;
+    // (asked each time: low-memory and the memory watchdog change it. RX_VK_CAP_SPARE_MB=<n>, 0: no spare cap)
+    if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
+    if (low_mem_on(nullptr)) return 16ull << 20;
+    uint64_t used = 0, allowed = 0;
+    return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : ~0ull;
 }
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
     std::lock_guard lk(cap_free_mu);
@@ -1438,7 +1445,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     // (captures past the last kKeep, or past the byte budget, retired once the work that read them is done)
     while (!cap_bufs.empty()) {
         auto oldest = cap_bufs.begin();
-        const bool over = cap_bufs.size() > kKeep || cap_bytes > kCapBytesMax;
+        const bool over = cap_bufs.size() > kKeep || cap_bytes > cap_bytes_max();
         if (!over || std::max(oldest->second.value, oldest->second.last_use) > completed) break;
         cap_buf_retire(oldest);
     }
