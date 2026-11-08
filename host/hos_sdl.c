@@ -13,7 +13,7 @@ static int version;   /* 3, 2, or 0 none */
 static struct {
     void *InitSubSystem, *SetHint, *GetError;
     /* window */
-    void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
+    void *CreateWindow, *SetWindowPosition, *SetWindowTitle, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
         *PollEvent, *LoadPNG, *SetWindowIcon, *DestroySurface;
     /* sound */
@@ -40,6 +40,7 @@ static int get_all(HMODULE m, int three) {
     GET(SetHint, "SDL_SetHint");
     GET(GetError, "SDL_GetError");
     GET(CreateWindow, "SDL_CreateWindow");
+    GET(SetWindowTitle, "SDL_SetWindowTitle");
     GET(SetWindowFullscreen, "SDL_SetWindowFullscreen");
     GET2(SetRelativeMouseMode, "SDL_SetWindowRelativeMouseMode", "SDL_SetRelativeMouseMode");
     GET(GetDesktopDisplayMode, "SDL_GetDesktopDisplayMode");
@@ -164,6 +165,10 @@ int hos_sdl_desktop_size(int *width, int *height) {
 int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out) {
     return version == 3 ? CALL(_Bool (*)(void *, void *, const void *, void *), Vulkan_CreateSurface)(window, instance, NULL, surface_out)
                         : CALL(int (*)(void *, void *, void *), Vulkan_CreateSurface)(window, instance, surface_out) != 0;
+}
+void hos_sdl_set_title(void *window, const char *title) {
+    if (!window || !title || !hos_sdl_load()) return;
+    CALL(void (*)(void *, const char *), SetWindowTitle)(window, title);
 }
 void hos_sdl_pixel_size(void *window, int *width, int *height) {
     if (version == 3) CALL(_Bool (*)(void *, int *, int *), PixelSize)(window, width, height);

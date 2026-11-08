@@ -80,7 +80,7 @@ static int fullscreen;
 
 static int create_surface(void *w, void *instance, void *surface) { return hos_sdl_vulkan_surface(w, instance, surface); }
 static void drawable_size(void *w, int *width, int *height) { hos_sdl_pixel_size(w, width, height); }
-static void set_title(void *w, const char *title) { if (w && title) sdl.SetWindowTitle(w, title); }
+static void set_title(void *w, const char *title) { hos_sdl_set_title(w, title); }
 static MkwVkWindow vk_window = {MKWVK_WINDOW_VERSION, create_surface, drawable_size, NULL, set_title};
 
 static void mouse_capture(int on) {
@@ -205,8 +205,11 @@ void hos_display_loop(void) {
             do {
                 switch (e.type) {
                 case HOS_SDL_EV_QUIT:
-                case HOS_SDL_EV_CLOSE:
                     hos_log("display: window closed, exiting");
+                    hos_log_flush();
+                    ExitProcess(0);
+                case HOS_SDL_EV_CLOSE:
+                    hos_log("display: window closed, exiting (not a GPU reset)");
                     hos_log_flush();
                     ExitProcess(0);
                 case HOS_SDL_EV_RESIZED:
@@ -214,15 +217,6 @@ void hos_display_loop(void) {
                         int w = 0, h = 0;
                         hos_sdl_pixel_size(window, &w, &h);
                         rx_resize(w, h);
-                    } else if (what == WE_FOCUS_GAINED) {
-                        hos_posix_window[0] = 1;
-                    } else if (what == WE_FOCUS_LOST || what == WE_LEAVE) {
-                        if (what == WE_FOCUS_LOST) hos_posix_window[0] = 0;
-                        mouse_capture(0);
-                    } else if (what == WE_CLOSE) {
-                        hos_log("display: SDL_WINDOWEVENT_CLOSE, window closed, exiting (not a GPU reset)");
-                        hos_log_flush();
-                        ExitProcess(0);
                     }
                     break;
                 case HOS_SDL_EV_FOCUS_GAINED:
