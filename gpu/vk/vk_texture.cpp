@@ -583,10 +583,10 @@ bool bc_scratch_layout(VkCommandBuffer cmd, bool resized = false) {
     return true;
 }
 /// (every present: the scratch unused for RX_VK_BC_IDLE_S seconds goes with the images the GPU is done with)
-void bc_scratch_idle() {
-    if (!bc_have.load(std::memory_order_relaxed) || !bc_idle_s()) return;
+void bc_scratch_idle(bool force = false) {
+    if (!bc_have.load(std::memory_order_relaxed) || (!force && !bc_idle_s())) return;
     std::lock_guard lk(bc_mu);
-    if (!bc_have || std::chrono::steady_clock::now() - bc_used_at < std::chrono::seconds(bc_idle_s())) return;
+    if (!bc_have || (!force && std::chrono::steady_clock::now() - bc_used_at < std::chrono::seconds(bc_idle_s()))) return;
     Dead d{bc_last_value, bc_scratch, bc_scratch_alloc, {bc_scratch_view}, {}};
     d.buffer = bc_out, d.buffer_alloc = bc_out_alloc;
     dead.push_back(std::move(d));
@@ -597,7 +597,8 @@ void bc_scratch_idle() {
         dead.push_back(Dead{bc_last_value, bc_scratch2, bc_scratch2_alloc, {bc_scratch2_view}, {}});
         bc_scratch2 = VK_NULL_HANDLE, bc_scratch2_alloc = nullptr, bc_scratch2_view = VK_NULL_HANDLE, bc_scratch2_fresh = false;
     }
-    logf("vk: the BC3 scratch (%s) unused for %u s: given back", second ? "288 MB, both" : "160 MB", bc_idle_s());
+    logf("vk: the BC3 scratch (%s) %s: given back", second ? "288 MB, both" : "160 MB",
+         force ? "released under memory pressure" : "unused");
 }
 
 /// The storage view of one level (every layer) the ASTC decoder writes
@@ -2889,13 +2890,14 @@ void texture_frame(uint64_t completed) {
             uint64_t used = 0, allowed = 0;
             return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
         }();
+        const uint64_t keep_now = mem_pressure_level() >= 1 ? 0 : keep;
         for (auto it = arenas.begin(); it != arenas.end();) {
             const bool idle = it->value <= completed && it->value != rec_value;
             // (and one nothing has staged into for 30 s: Kokiri Forest's gameplay stages next to nothing, and the 64 MB it kept are VRAM
             // behind the BAR. A load makes one again. RX_VK_STAGING_IDLE_S=<n>: that long, 0: kept)
             static const int64_t idle_s = getenv("RX_VK_STAGING_IDLE_S") ? atoll(getenv("RX_VK_STAGING_IDLE_S")) : 30;
             const bool stale = idle_s && std::chrono::steady_clock::now() - it->used_at > std::chrono::seconds(idle_s);
-            if (idle && (it->size > kArena || kept + it->size > keep || stale)) {
+            if (idle && (it->size > kArena || kept + it->size > keep_now || stale)) {
                 destroy_buffer(it->buffer, it->allocation);
                 it = arenas.erase(it);
                 continue;
@@ -2987,13 +2989,48 @@ void texture_frame(uint64_t completed) {
     // out. RX_VK_BUDGET_BY_BLOCKS=1: as before)
     static const bool by_blocks = getenv("RX_VK_BUDGET_BY_BLOCKS") != nullptr;
     const uint64_t pressure = by_blocks ? used : used - std::min(used, block_free);
-    if (known && pressure > allowed / 10 * 9) {
-        const uint64_t over = pressure - allowed / 10 * 9;
+    uint64_t allowed_eff = allowed;
+    const MemPressure press = mem_watch_on() ? mem_pressure() : MemPressure{0, ~0ull >> 1, 0};
+    if (known && low_mem_on(nullptr) && mem_watch_on()) {
+        const uint64_t head = press.avail > (1536ull << 20) ? press.avail - (1536ull << 20) : 0;
+        allowed_eff = std::min(allowed, deck_gpu_cap());
+        allowed_eff = std::min(allowed_eff, used + head);
+    }
+    if (known && pressure > allowed_eff / 10 * 9) {
+        const uint64_t over = pressure - allowed_eff / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
-    if (known && !by_blocks && used > allowed / 100 * 97) {
-        const uint64_t over = used - allowed / 100 * 97;
+    if (known && !by_blocks && used > allowed_eff / 100 * 97) {
+        const uint64_t over = used - allowed_eff / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
+    }
+    if (press.level >= 1 && press.deficit)
+        budget = std::min(budget, total_bytes > press.deficit ? total_bytes - press.deficit : 0);
+    static int told_level = 0;
+    if (press.level >= 1) {
+        static auto acted = std::chrono::steady_clock::time_point{};
+        const auto nowp = std::chrono::steady_clock::now();
+        const bool level_changed = told_level != press.level;
+        const bool due = level_changed || nowp - acted >= std::chrono::seconds(press.level >= 2 ? 5 : 2);
+        if (due) {
+            acted = nowp;
+            told_level = press.level;
+            bc_scratch_idle(true);
+#if defined(__linux__) && defined(__GLIBC__)
+            static auto trimmed = std::chrono::steady_clock::time_point{};
+            if (trimmed.time_since_epoch().count() == 0 || nowp - trimmed >= std::chrono::seconds(30)) {
+                trimmed = nowp;
+                jobs_push([] { malloc_trim(0); });
+            }
+#endif
+            logf("vk: pressure L%d avail=%llu deficit=%llu: budget %llu MB, spares 0, staging 0, bc scratch given back, trim queued",
+                 press.level, (unsigned long long)(press.avail >> 20), (unsigned long long)(press.deficit >> 20),
+                 (unsigned long long)(budget >> 20));
+            if (press.level >= 2) logf("vk: MEMORY CRITICAL avail=%llu MB", (unsigned long long)(press.avail >> 20));
+        }
+    } else if (told_level != 0) {
+        told_level = 0;
+        logf("vk: pressure L0 avail=%llu deficit=0", (unsigned long long)(press.avail >> 20));
     }
     if (frame_no % 600 == 0) {
         vma_log_heaps();
@@ -3117,9 +3154,10 @@ void texture_frame(uint64_t completed) {
     // is not in low-memory mode... both are milliseconds now when MIN_MS is set; otherwise 1000.
     static const uint64_t min_unused_ms =
         getenv("RX_VK_EVICT_MIN_MS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_MS"))) : 1000;
+    const uint64_t unused_ms = press.level >= 2 ? std::min<uint64_t>(min_unused_ms, 250) : min_unused_ms;
     const uint64_t now_ms = tex_now_ms();
     for (auto& [last, tex] : order) {
-        if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, min_unused_ms) : min_unused_ms)) break;
+        if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3128,7 +3166,9 @@ void texture_frame(uint64_t completed) {
         // (one unused for 3600 presents (a minute) goes: a course left behind; the game draws it again when it comes
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
         // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
-        const uint64_t keep_rendered_ms = known && used > allowed ? 10000 : 60000;
+        uint64_t keep_rendered_ms = known && used > allowed_eff ? 10000 : 60000;
+        if (press.level >= 1) keep_rendered_ms = std::min<uint64_t>(keep_rendered_ms, 10000);
+        if (press.level >= 2) keep_rendered_ms = std::min<uint64_t>(keep_rendered_ms, 2000);
         // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
         // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
         // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the

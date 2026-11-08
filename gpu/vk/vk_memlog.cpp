@@ -19,7 +19,6 @@ bool deck_memlog_on() {
     if (const char* e = getenv("RX_VK_DECK_MEMLOG")) return e[0] != '0';
     return low_mem_on(nullptr);
 }
-int mem_pressure_level() { return 0; }
 
 namespace {
 uint64_t kb_of(const char* text, const char* key) {

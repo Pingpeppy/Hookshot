@@ -828,6 +828,7 @@ uint64_t cap_free_bytes = 0;   // (cap_free_mu)
 uint64_t cap_spare_max() {
     // (asked each time: low-memory and the memory watchdog change it. RX_VK_CAP_SPARE_MB=<n>, 0: no spare cap)
     if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
+    if (mem_pressure_level() >= 1) return 0;
     if (low_mem_on(nullptr)) return 16ull << 20;
     uint64_t used = 0, allowed = 0;
     return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : ~0ull;
@@ -2463,11 +2464,12 @@ void imports_give_back() {   // (pools_mu held)
     }
     // (hookshot) Off by default on Windows, as giving retired imports back is (RX_VK_KEEP_RETIRED, retired_imports_give_back:
     // device losses on Intel Arc and AMD right after imports went back): RX_VK_IMPORT_HIGH=85 turns it on there
-    static const char* env_high = getenv("RX_VK_IMPORT_HIGH");
+    const char* env_high = getenv("RX_VK_IMPORT_HIGH");
 #ifdef _WIN32
-    static const int high = env_high ? atoi(env_high) : 0;
+    int high = env_high ? atoi(env_high) : 0;
 #else
-    static const int high = env_high ? atoi(env_high) : 85;
+    int high = env_high ? atoi(env_high) : 85;
+    if (!env_high && mem_pressure_level() >= 1) high = 60;
 #endif
     static const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 75;
     static uint64_t calls = 0;

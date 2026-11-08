@@ -282,6 +282,10 @@ struct DeckMemSnap {
 void deck_memlog_emit(DeckMemSnap snap);
 bool deck_memlog_on();
 int mem_pressure_level();
+bool mem_watch_on();
+struct MemPressure { int level; uint64_t avail, deficit; };
+MemPressure mem_pressure();
+uint64_t deck_gpu_cap();
 
 } // namespace mkwvk
 
