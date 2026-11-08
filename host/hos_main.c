@@ -622,9 +622,10 @@ static void deck_profile(void) {
     if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
     if (!getenv("RX_VK_DECK")) setenv("RX_VK_DECK", "1", 0);
     fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap, "
-                    "game told 4608 MB, low-memory texture and staging limits). "
+                    "game told the Switch 2 heap of 9809 MB, low-memory texture and staging limits). "
                     "RX_VK_DECK=0 turns the profile off. RX_VK_LOW_MEM=0 turns the memory limits off. "
-                    "HOS_MEMORY_MB overrides the 4608.\n");
+                    "RX_VK_LOW_HEAP=1 tells the game 4608 MB, which leaves a pointer null at the first submit. "
+                    "HOS_MEMORY_MB overrides the heap.\n");
 }
 /* (linux) The window belongs on the process's main thread (SDL), so the game runs on a thread of its own, with the
    stack the guest main thread's lifted code needs (the main thread has the system's 8 MB): host/posix/display_sdl.c */

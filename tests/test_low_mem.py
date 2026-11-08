@@ -23,8 +23,10 @@ def main():
     need("gpu/vk/vk_shader.cpp", "POSIX_FADV_DONTNEED", "index only", "spirv_env")
     need("gpu/vk/vk_draw.cpp", "RX_VK_PRECOMPILE_THREADS", "RX_VK_PRECOMPILE_FREE_MB", "shader prep")
     need("gpu/vk/vk_jobs.cpp", "RX_VK_LOW_COMPILE", "1 background worker")
-    need("host/hos_mem.c", "4608ULL", "RX_VK_LOW_HEAP")
-    need("host/hos_main.c", "RX_VK_LOW_MEM=0", "HOS_GUEST_MEMFD")
+    mem = need("host/hos_mem.c", "4608ULL", "RX_VK_LOW_HEAP", "9809ULL")
+    if "RX_VK_DECK" in mem or "MemTotal:" in mem:
+        raise SystemExit("host/hos_mem.c: the 4608 MB heap must be RX_VK_LOW_HEAP=1 only")
+    need("host/hos_main.c", "RX_VK_LOW_MEM=0", "HOS_GUEST_MEMFD", "9809 MB", "RX_VK_LOW_HEAP=1")
     need("host/posix/win32_posix.c", "_exit(128 + sig)")
     need("gpu/vk/vk_replay.cpp", "RX_VK_BATCH_HOLD_FIRST", "the first submit is sent now")
     need("gpu/vk/vk_memory.cpp", "udmabuf", "RX_VK_NO_DMABUF")
