@@ -639,12 +639,65 @@ static int valve_deck(void) {
     closedir(d);
     return 0;
 }
+/* handheld_profile= in either options file (the folder, or bin/ beside the exe). -1: not set. */
+static int deck_ini_handheld(char *found, size_t nfound) {
+    char path[MAX_PATH], folded[MAX_PATH], raw[MAX_PATH];
+    const char *cands[2];
+    int nc = 0;
+    DWORD n = hos_game_path_a(path, MAX_PATH);
+    char *slash = n ? (strrchr(path, '/') ? strrchr(path, '/') : strrchr(path, '\\')) : NULL;
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        snprintf(folded, sizeof folded, "%s", path);
+        cands[nc++] = folded;
+    }
+    n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    slash = n && n < MAX_PATH ? (strrchr(path, '/') ? strrchr(path, '/') : strrchr(path, '\\')) : NULL;
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        if (!nc || strcmp(cands[0], path) != 0) {
+            snprintf(raw, sizeof raw, "%s", path);
+            cands[nc++] = raw;
+        }
+    }
+    for (int i = 0; i < nc; i++) {
+        FILE *f = fopen(cands[i], "r");
+        if (!f) continue;
+        char line[96];
+        int v = -1;
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
+        fclose(f);
+        if (v >= 0) {
+            if (found && nfound) snprintf(found, nfound, "%s", cands[i]);
+            return v;
+        }
+    }
+    if (found && nfound) found[0] = 0;
+    return -1;
+}
 static void deck_profile(void) {
     if (!valve_deck()) return;
     if (!getenv("HOOKSHOT_OCCLUSION_OFF")) setenv("HOOKSHOT_OCCLUSION_OFF", "1", 0);
     if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
     if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
     if (!getenv("RX_VK_DECK")) setenv("RX_VK_DECK", "1", 0);
+    if (!(getenv("RX_VK_DECK") && getenv("RX_VK_DECK")[0] == '0')) {
+        char ini_path[MAX_PATH] = "";
+        const int ini = deck_ini_handheld(ini_path, sizeof ini_path);
+        if (getenv("HOS_HANDHELD"))
+            fprintf(stderr, "hookshot: handheld left as HOS_HANDHELD=%s (ini handheld_profile=%s%s)\n",
+                    getenv("HOS_HANDHELD"), ini < 0 ? "unset" : ini ? "1" : "0", ini_path);
+        else if (ini == 0) {
+            setenv("HOS_HANDHELD", "0", 0);
+            fprintf(stderr, "hookshot: handheld off (handheld_profile=0 in %s)\n", ini_path);
+        } else {
+            setenv("HOS_HANDHELD", "1", 0);
+            fprintf(stderr, "hookshot: handheld on (HOS_HANDHELD=1%s%s)\n",
+                    ini == 1 ? ", ini handheld_profile=1 " : ", no handheld_profile, Deck default ",
+                    ini == 1 ? ini_path : "");
+        }
+    }
     fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap, "
                     "game told the Switch 2 heap of 9809 MB, low-memory texture and staging limits). "
                     "RX_VK_DECK=0 turns the profile off. RX_VK_LOW_MEM=0 turns the memory limits off. "
