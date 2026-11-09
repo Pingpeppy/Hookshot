@@ -5,6 +5,7 @@
 #include "vk_loader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -730,6 +731,10 @@ void splash_title(const char* text) {
 #endif
 }
 
+// Set while the RADV driver thread is inside an ICD call. A queue submit then waits on the device
+// lock that call holds, and the wait loop (the stall watchdog, the progress log) never runs.
+std::atomic<int> radv_on_driver{0};
+
 // A clear plus one small copy. No pipeline is built, so this does not join the shader compiles.
 void splash_progress(size_t done, size_t total) {
     if (dev.offscreen || !dev.swapchain) return;
@@ -768,6 +773,7 @@ void splash_progress(size_t done, size_t total) {
     char both[160];
     snprintf(both, sizeof both, "%s%s%s", line, eta[0] ? " — " : "", eta);
     splash_title(both);
+    if (radv_on_driver.load(std::memory_order_acquire) != 0) return;
     if (!splash_init()) return;
     const int pct = total ? (int)(done * 100 / total) : -1;
     if (splash.last_draw.time_since_epoch().count() != 0 && now - splash.last_draw < std::chrono::milliseconds(250) &&
@@ -1199,7 +1205,9 @@ void radv_thread_main() {
             job = std::move(radv_q.front());
             radv_q.pop_front();
         }
+        radv_on_driver.fetch_add(1, std::memory_order_acq_rel);
         job();
+        radv_on_driver.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 void radv_ensure_thread() {

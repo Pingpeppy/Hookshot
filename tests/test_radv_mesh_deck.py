@@ -54,6 +54,12 @@ def main():
         raise SystemExit("vk_shader.cpp: the program cache must be loaded in file order after prep")
     if "nothing to build" not in DRAW:
         raise SystemExit("vk_draw.cpp: an empty predict must log, not go silent after prepared")
+    if "of %zu pipelines" not in DRAW:
+        raise SystemExit("vk_draw.cpp: precompile must log how many pipelines have finished")
+    if "no write-back" not in TEX:
+        raise SystemExit("vk_texture.cpp: a GPU-written texture with no write-back must stay resident")
+    if "radv_on_driver" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: the progress bar must not submit while the RADV driver thread is in a create")
     if "Preparing shaders:" not in VKMAIN or "splash_progress" not in VKMAIN:
         raise SystemExit("vk_main.cpp: shader prep must draw Preparing shaders: N / total on the window")
     if "predicting pipelines from" not in DRAW or "startup_driver_threads" not in DRAW:

@@ -6073,17 +6073,24 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     unsigned npre = startup_driver_threads(std::min(cpus, 64u));
     if (!getenv("RX_VK_PRECOMPILE_THREADS") && low_mem_on("RX_VK_LOW_COMPILE")) npre = std::min(npre, 6u);
-    logf("vk: precompile on %u thread%s", npre, npre == 1 ? "" : "s");
+    logf("vk: precompile on %u thread%s (%zu pipelines)", npre, npre == 1 ? "" : "s", total);
     for (unsigned i = 0; i < npre; i++) threads.emplace_back(worker);
     static const int stall_s = getenv("RX_VK_PRECOMPILE_STALL_S") ? atoi(getenv("RX_VK_PRECOMPILE_STALL_S")) : 30;
     size_t last_done = 0;
     auto last_change = std::chrono::steady_clock::now();
+    auto last_log = last_change;
     bool gone_on = false;
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);
         if (next.load() >= total + threads.size()) break;
         const auto now = std::chrono::steady_clock::now();
+        // A warm start used to sit here with a frozen log: the workers are inside the driver, and
+        // nothing else prints until they finish. Two minutes of that is not distinguishable from a hang.
+        if (now - last_log >= std::chrono::seconds(2)) {
+            last_log = now;
+            logf("vk: precompile: %zu of %zu pipelines", done.load(), total);
+        }
         if (done.load() != last_done) last_done = done.load(), last_change = now;
         // The workers claim one job and block in the driver before claiming the rest, so requiring
         // next >= total meant a stuck create never tripped this and the wait never ended.
