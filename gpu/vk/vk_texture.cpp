@@ -3225,13 +3225,18 @@ void texture_frame(uint64_t completed) {
         uint64_t blocks = 0, alloc = 0, free_b = 0, sys_u = 0, sys_b = 0, sys_a = 0;
         vma_heap_account(&heap_before, &blocks, &alloc, &free_b, &sys_u, &sys_b, &sys_a);
     }
+    size_t kept_gpu = 0;
     for (auto& [last, tex] : order) {
         const bool baked = tex->first_written && tex->first_written == tex->last_written && tex->bytes <= (4ull << 20);
         bool overwritten = false;
         if (scene_now) {
             if (tex->last_frame >= burst_at || tex->last_value > completed || baked) continue;
         } else {
-        if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
+        // The working-set budget is already the last 8 presents plus a margin. The old 7/8 floor
+        // spent that margin: Kokiri sat about 100 MB over and every pass retired textures down
+        // through the margin, which the next frames made again (the fps, and the white ones).
+        const uint64_t stop_at = !sweep && ws_on ? budget : budget / 8 * 7;
+        if ((!sweep && total_bytes <= stop_at) || now_ms - last < (sweep ? std::max<uint64_t>(2000, unused_ms) : unused_ms)) break;
         // Over the working-set budget the keep is the same 8 presents the budget is built from. 90 presents kept
         // about a second of idle textures (the run sat ~800 MB over its budget and swapped).
         const uint64_t keep_frames = !sweep && ws_on ? 8 : min_presents;
@@ -3280,10 +3285,20 @@ void texture_frame(uint64_t completed) {
         // tiled pattern over the Deku Tree's planks and Hyrule Field's path, with a 16 GB card's textures at the 6 GB budget
         // (issue 386). RX_VK_EVICT_NO_FLUSH=1: not written back, as before)
         static const bool no_flush = getenv("RX_VK_EVICT_NO_FLUSH") != nullptr;
+        bool wrote_back = false;
         if (!no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex) &&
             flush_texture(*tex, tex->gpu, tex->gpu + tex->guest_size)) {
+            wrote_back = true;
             static std::atomic<int64_t> flushed{0};
             if (++flushed % 50 == 1) logf("vk: textures the GPU drew, written back into their memory before eviction: %lld so far", (long long)flushed.load());
+        }
+        // The image is the only copy when the GPU drew it and the write-back did not happen (ASTC, BC,
+        // over 16 MB, or the read failed). Retiring it left the next image cleared: grass and leaves
+        // sampled white. RX_VK_EVICT_RENDERED=1: retired anyway. A scene change still drops the old one.
+        static const bool evict_rendered = getenv("RX_VK_EVICT_RENDERED") != nullptr;
+        if (!scene_now && !overwritten && tex->gpu_written && !tex->released && !evict_rendered && !wrote_back) {
+            kept_gpu++;
+            continue;
         }
         watch_tex(tex, "evicted");
         if (remade_log_on()) {
@@ -3307,7 +3322,11 @@ void texture_frame(uint64_t completed) {
         }
     }
     const size_t n = order.size() - textures.size();
-    if (n) logf("vk: %zu textures retired (%zu left, %llu MB)", n, textures.size(), (unsigned long long)(total_bytes >> 20));
+    if (n && kept_gpu)
+        logf("vk: %zu textures retired (%zu left, %llu MB); %zu the GPU wrote kept, no write-back", n, textures.size(),
+             (unsigned long long)(total_bytes >> 20), kept_gpu);
+    else if (n)
+        logf("vk: %zu textures retired (%zu left, %llu MB)", n, textures.size(), (unsigned long long)(total_bytes >> 20));
     if (scene_now) {
         bursting = false;
         for (auto it = arenas.begin(); it != arenas.end();) {
