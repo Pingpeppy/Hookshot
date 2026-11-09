@@ -85,7 +85,7 @@ def main():
         raise SystemExit("vk_texture.cpp: a GPU-written texture with no write-back must stay resident")
     if "RX_VK_RETIRE" not in TEX or "working-set retirement off (RX_VK_WS_BUDGET=0)" not in TEX:
         raise SystemExit("vk_texture.cpp: RX_VK_WS_BUDGET=0 and RX_VK_RETIRE=0 must skip the retire pass")
-    if "frame_no - tex->last_frame < 8" not in TEX or "in_graph" not in TEX:
+    if "frame_no - t->last_frame < 8" not in TEX or "last_value > completed" not in TEX:
         raise SystemExit("vk_texture.cpp: the last 8 presents and this frame's render targets must not be retired")
     if "not retiring BC images" not in TEX or "keep_image_that_would_clear" not in TEX:
         raise SystemExit("vk_texture.cpp: BC images must not be retired; a new one stays cleared")
@@ -108,7 +108,7 @@ def main():
         raise SystemExit("vk_shader.cpp: stamp-ignore markers are not paired")
     if "hookshot_vk_pipelines.bin" not in DRAW or "PipelineCreateLock" not in DRAW:
         raise SystemExit("vk_draw.cpp: the pipeline cache is Hookshot's, and creates take the RADV lock")
-    if "st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT" not in DRAW or "mesh pipeline includes the task and mesh stages" not in DRAW:
+    if "st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)" not in DRAW or "mesh pipeline includes the task and mesh stages" not in DRAW:
         raise SystemExit("vk_draw.cpp: a mesh pipeline must keep its task and mesh stages")
     if "RX_VK_MESH_FALLBACK" not in VKMAIN:
         raise SystemExit("vk_main.cpp: RX_VK_MESH_FALLBACK=1 must force the compute fallback")

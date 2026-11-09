@@ -75,7 +75,7 @@ struct Device {
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
          native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
-    bool mesh_fallback = false;   // (issue 640, kept: task and mesh programs as compute. RX_VK_MESH_FALLBACK=1 forces it)
+    bool mesh_fallback = false;   // (issue 640: no mesh shaders, or RX_VK_MESH_FALLBACK=1: task and mesh programs as compute)
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
@@ -266,7 +266,10 @@ bool create_swapchain(uint32_t width, uint32_t height);
 bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
-bool prepare_run(void (*progress)(size_t done, size_t total));
+bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
+bool prepare_is_update();
+void prepare_background();
+void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 /// Live graphics pipelines and translated programs (the Deck memory line)

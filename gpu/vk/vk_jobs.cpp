@@ -1,6 +1,8 @@
 // The worker threads (vk_jobs.h). As many as a third of the hardware threads (2 to 4): the game itself runs six
 // virtual cores, and the replay thread is one of the busiest.
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -9,6 +11,7 @@
 
 #include "vk_jobs.h"
 #include "vk_internal.h"
+#include "vk_draw.h"   // (ub_thread_off)
 
 namespace mkwvk {
 namespace {
@@ -19,9 +22,24 @@ std::deque<std::function<void()>> queue;
 std::atomic<int> pending{0};
 bool started = false;
 
+// (a job that throws: the game ended at once ("approach Malon, crash": an exception escaped a worker, KERNELBASE's RaiseException
+// with no handler, 2026-11-08). It is logged and let go; what it was making stays not ready and is asked for again)
+void run_guarded(std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        static std::atomic<int> logged;
+        if (logged++ < 20) logf("vk: a background job failed: %s", e.what());
+    } catch (...) {
+        static std::atomic<int> logged;
+        if (logged++ < 20) logf("vk: a background job failed (not a std::exception)");
+    }
+}
+
 void worker() {
     SetThreadPriority(GetCurrentThread(), low_mem_on("RX_VK_LOW_COMPILE") ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
+    ub_thread_off();
     for (;;) {
         std::function<void()> fn;
         {
@@ -30,7 +48,7 @@ void worker() {
             fn = std::move(queue.front());
             queue.pop_front();
         }
-        fn();
+        run_guarded(fn);
         pending--;
         jobs_notify();
     }
@@ -76,6 +94,7 @@ void jobs_push_serial(std::function<void()> fn) {
         std::thread([] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             SetThreadDescription(GetCurrentThread(), L"mkw_vk serial builds");
+            ub_thread_off();
             for (;;) {
                 std::function<void()> fn;
                 {
@@ -84,7 +103,7 @@ void jobs_push_serial(std::function<void()> fn) {
                     fn = std::move(sq.front());
                     sq.pop_front();
                 }
-                fn();
+                run_guarded(fn);
                 jobs_notify();
             }
         }).detach();

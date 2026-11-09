@@ -91,6 +91,20 @@ def failure_reason(lines):
     return tail[-1] if tail else "no output"
 
 
+def killed_reason():
+    """(issues 478, 768, 807) A step stopped by SIGKILL or SIGTERM from outside the build: the builder's own Cancel stops make_game
+    with it, so this is the system's, the kernel's or a desktop's low-memory killer most likely. Its last lines then said nothing
+    of that (the lift's emit processes failing on their result pipe, BrokenPipeError, or the lift's last progress line)"""
+    total = None
+    try:
+        with open("/proc/meminfo") as f:
+            total = next((round(int(l.split()[1]) / (1 << 20)) for l in f if l.startswith("MemTotal:")), None)   # (kB, to the nearest GB)
+    except (OSError, ValueError, IndexError):
+        pass
+    return ("the system stopped it, most likely because the PC ran out of memory%s. Close other programs and build again"
+            % (" (%d GB here)" % total if total else ""))
+
+
 def reported(line):
     """The sentence a builder shows. @@check is '@@check <ok|bad> <text>'; @@error is '@@error <text>'. None otherwise."""
     if line.startswith("@@error "):
@@ -218,7 +232,7 @@ def run(cmd, env=None, on_line=None, check=True, output=None):
     if code and check:
         step = next((os.path.basename(c) for c in cmd[1:] if c.endswith(".py")), os.path.basename(cmd[-1]))   # (issue 154: not "-u")
         status = "signal %d" % -code if os.name == "posix" and code < 0 else "exit status %d" % code
-        fail("%s stopped (%s): %s" % (step, status, failure_reason(lines)))
+        fail("%s stopped (%s): %s" % (step, status, killed_reason() if os.name == "posix" and -code in (9, 15) else failure_reason(lines)))
     return code
 
 
@@ -595,6 +609,17 @@ def stop_stray_compilers(work, default_work):
         print("could not look for an earlier build's processes: %s" % e, flush=True)
 
 
+def makefile_words(text):
+    """Decode clang -M words, preserving ordinary Windows backslashes."""
+    text = re.sub(r"\\\r?\n", " ", text)
+    words = re.findall(r"(?:\\[ \t]|\S)+", text)
+    # clang doubles backslashes before an escaped space, but adds only one before #.
+    def unescape(m):
+        slashes, char = m.groups()
+        return "\\" * ((len(slashes) - 1) // 2 if char != "#" else len(slashes) - 1) + char
+    return [re.sub(r"(\\+)([ \t#])", unescape, word).replace("$$", "$") for word in words]
+
+
 def _drop_stale_linux(work):
     """The AppImage's sysroot is a new /tmp/.mount_... path every start. The stamp is the compiler's version and stdio.h's
     bytes, not that path, so an update reuses the compiled game when the headers did not change (the Windows stamp leaves
@@ -650,7 +675,7 @@ def drop_stale_objects(work):
                            encoding="utf-8", errors="replace")
     if r.returncode:
         return
-    found = sorted({h.lower() for h in re.findall(r"\S+\.h\b", r.stdout.replace("\\" + chr(10), " "))})
+    found = sorted({h.lower() for h in makefile_words(r.stdout) if h.endswith(".h")})
 
     # (issue 565) The paths are taken relative to the builder's own folder, with the compiler's version: under
     # versions\<tag>\ every release looked like new headers, and an update compiled everything again (2+ hours). clang
@@ -714,6 +739,20 @@ def seed_pipelines(out):
         pass
     shutil.copyfile(seed, dst)
     print("the shipped pipeline list: %d KB, built before the first title" % (os.path.getsize(seed) >> 10), flush=True)
+
+
+def ship_state_list(out):
+    """The pipeline state list made from a play of the game on the development PC (work/pipeline_states.bin: each pipeline's stage
+    code keys, vertex and target formats and draw state; hashes and state only, no game code), as the folder's
+    hookshot_pipeline_states_shipped.bin: the first start's shader preparation builds those pipelines before the title, from the
+    player's own shaders (hookshot_shaders.bin), instead of compiling each when it is first drawn. Good for any build: optional"""
+    src = os.path.join(ROOT, "work", "pipeline_states.bin")
+    dst = os.path.join(out, "hookshot_pipeline_states_shipped.bin")
+    if not os.path.isfile(src):
+        return
+    if not (os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False)):
+        shutil.copyfile(src, dst)
+    print("the shipped pipeline state list: %d pipelines" % ((os.path.getsize(src) - 12) // 528), flush=True)
 
 
 def folder_language(out):
@@ -1077,6 +1116,7 @@ def main(a=None):
     if LINUX and os.path.exists(icon):   # (the window's icon: host/posix/display_sdl.c)
         shutil.copy2(icon, os.path.join(out, "hookshot.png"))
     seed_pipelines(out)
+    ship_state_list(out)
     language = os.path.join(out, "language.txt")   # (the same text as host/nn_applet.c writes)
     with open(language, "w", encoding="utf-8", newline="\n") as f:
         f.write("# The game's language. Change the line below to one of the codes listed here, save, and start the game again.\n\n%s\n\n" % a.language)
@@ -1100,6 +1140,13 @@ def main(a=None):
     # changed; the builder says how much stays and lets it go. Kept in a development checkout)
     if os.path.normcase(work) != os.path.normcase(os.path.abspath(os.path.join(ROOT, "work"))):
         shutil.rmtree(exefs, ignore_errors=True)
+        # (players asked for the space back: the translated code and the compiled objects (4 GB and more) go too once the game is
+        # ready, on Windows and Linux alike. The next update translates and compiles again, about as long as a first build.
+        # HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, as before)
+        if os.environ.get("HOOKSHOT_KEEP_BUILD_FILES", "0") in ("", "0"):
+            for sub in ("sa", "objcache", "probe"):
+                shutil.rmtree(os.path.join(work, sub), ignore_errors=True)
+            print("the build files in %s were deleted (HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quicker updates)" % work, flush=True)
     total_seconds = time.time() - STARTED
     previous = record_times(work, run_files, compile_seconds, total_seconds, modules=plan[1],
                             kind="update" if a.update else "build")

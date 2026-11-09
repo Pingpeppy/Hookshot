@@ -32,6 +32,10 @@ public partial class MainWindow : Window
     string? current;
     string finished = "";
     string? chosenNup, romfs, exefs;
+    // (issue 650) "Using the folders ..." above the list of .nup files, while romfs and exefs are the game files: FillDumps clears the
+    // list, so the note is made there again each time (it was gone as soon as the list was first filled)
+    string? foldersNote;
+    TextBlock? foldersNoteBlock;
     bool updating, checking;
     double compiled;
     int filesDone, filesOf;
@@ -269,8 +273,7 @@ public partial class MainWindow : Window
         {
             romfs = s.Romfs;
             exefs = s.Exefs;
-            DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {romfs} and {exefs} (as last time)", Style = (Style)FindResource("Note"),
-                                                        Margin = new Thickness(16, 12, 16, 12) });
+            foldersNote = $"Using the folders {romfs} and {exefs} (as last time)";
         }
         else if (s.Nup != null && File.Exists(s.Nup))
         {
@@ -413,6 +416,12 @@ public partial class MainWindow : Window
     void FillDumps()
     {
         DumpList.Children.Clear();
+        foldersNoteBlock = null;
+        if (romfs != null && exefs != null && foldersNote != null)
+        {
+            foldersNoteBlock = new TextBlock { Text = foldersNote, Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) };
+            DumpList.Children.Add(foldersNoteBlock);
+        }
         if (dumps.Count == 0)
         {
             DumpList.Children.Add(new TextBlock
@@ -476,11 +485,12 @@ public partial class MainWindow : Window
                 ShowProblem(r.Text, tools: true);
                 return;
             }
-            if (chosenNup == null && r.Ok) chosenNup = d.Path;
+            // (issue 650: not over the romfs and exefs folders the player chose, here or last time: the found .nup showed as chosen)
+            if (chosenNup == null && romfs == null && r.Ok) chosenNup = d.Path;
             FillDumps();
             Refresh();
         }
-        if (chosenNup == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
+        if (chosenNup == null && romfs == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
         checking = false;
         Refresh();
     }
@@ -490,6 +500,8 @@ public partial class MainWindow : Window
         sourcePicked = true;
         chosenNup = path;
         romfs = exefs = null;
+        if (foldersNoteBlock != null) DumpList.Children.Remove(foldersNoteBlock);   // (not the whole list again: this row's own event)
+        foldersNoteBlock = null;
         Refresh();
     }
 
@@ -574,8 +586,8 @@ public partial class MainWindow : Window
         romfs = r;
         exefs = x;
         chosenNup = null;
-        foreach (var rb in DumpList.Children.OfType<RadioButton>()) rb.IsChecked = false;
-        DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {r} and {x}", Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) });
+        foldersNote = $"Using the folders {r} and {x}";
+        FillDumps();
         Refresh();
     }
 
@@ -611,7 +623,9 @@ public partial class MainWindow : Window
         if (WorkNote == null) return;
         var work = Storage.Work;
         WorkReset.Visibility = Storage.WorkChosen ? Visibility.Visible : Visibility.Collapsed;
-        WorkNote.Text = $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick. They can be freed after the build.";
+        WorkNote.Text = Storage.KeepBuildFiles
+            ? $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick (HOOKSHOT_KEEP_BUILD_FILES)."
+            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds, deleted when the game is ready.";
         WorkNote.Foreground = (Brush)FindResource("InkSoft");
         try
         {
@@ -932,7 +946,7 @@ public partial class MainWindow : Window
         }
         if (Finder.ShortcutError != null) AddLog("shortcut not made: " + Finder.ShortcutError);
         ShowPage(ReadyPage);
-        _ = ShowStorageUse();
+        _ = FreeAfterBuild();
     }
 
     // (issue: 5 GB and more left in %LOCALAPPDATA% and never said. Said here, with the way to let it go)
@@ -949,6 +963,19 @@ public partial class MainWindow : Window
         FreeButton.IsEnabled = true;
         FreeButton.Content = "Free up space";
         StorageRow.Visibility = Visibility.Visible;
+    }
+
+    // (players asked for the space back: the build files (translated code, compiled objects), the setup's and updater's downloads and
+    // older builder versions go as soon as the game is ready. The next update then translates and compiles again (about as long as
+    // this build). HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, with the Free up space button as before)
+    async Task FreeAfterBuild()
+    {
+        if (!Storage.KeepBuildFiles)
+        {
+            var left = await Task.Run(Storage.Free);
+            if (left >= 100L << 20) AddLog($"build files: {Storage.Gb(left)} could not be deleted (a file in use); they go after the next build");
+        }
+        await ShowStorageUse();
     }
 
     async void FreeSpace(object sender, RoutedEventArgs e)

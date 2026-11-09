@@ -85,26 +85,26 @@ HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
 }
 /* HOS_HANDHELD=1: handheld (the 1080p screen: 1080p output and the game's handheld resolutions) instead of docked
    (MKW docked composes 3840 x 2160) */
-/* handheld_profile= in hookshot_options.ini. -1: the file or the key is not there. The menu writes the file beside the
-   real executable and, when the game lives in bin/ next to image.bin, also beside the folder. Both are checked: run 10
-   had the key set and still reported docked because one of those paths was the one that was not read. */
-static int ini_handheld_key(const char *path) {
+/* The menu writes hookshot_options.ini beside the real executable and, when the game lives in bin/ next to image.bin,
+   also beside the folder. Both are checked: one Deck run had handheld_profile set and still reported docked. */
+static int ini_option_at(const char *path, const char *key, int *out) {
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f) return 0;
     char line[96];
-    int v = -1;
+    const size_t len = strlen(key);
+    int found = 0;
     while (fgets(line, sizeof line, f))
-        if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
+        if (!strncmp(line, key, len) && line[len] == '=') *out = atoi(line + len + 1), found = 1;
     fclose(f);
-    return v;
+    return found;
 }
-static int ini_handheld(char *found, size_t nfound) {
+static int ini_option(const char *key, int otherwise) {
     char path[MAX_PATH];
     const char *cands[2];
     int nc = 0;
+    static char folded[MAX_PATH], raw[MAX_PATH];
     DWORD n = hos_game_path_a(path, MAX_PATH);
     char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;
-    static char folded[MAX_PATH], raw[MAX_PATH];
     if (slash) {
         snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
         snprintf(folded, sizeof folded, "%s", path);
@@ -120,38 +120,38 @@ static int ini_handheld(char *found, size_t nfound) {
         }
     }
     for (int i = 0; i < nc; i++) {
-        const int v = ini_handheld_key(cands[i]);
-        if (v >= 0) {
-            if (found && nfound) snprintf(found, nfound, "%s", cands[i]);
-            return v;
-        }
+        int v = otherwise;
+        if (ini_option_at(cands[i], key, &v)) return v;
     }
-    if (found && nfound && nc) snprintf(found, nfound, "%s", cands[0]);
-    return -1;
+    return otherwise;
 }
 static int handheld(void) {
     static int v = -1;
+    if (v < 0) v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : ini_option("handheld_profile", 0) != 0;
+    return v;
+}
+/* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
+   1 2560 x 1440, 2 3840 x 2160. The game's frame is its display size (2560 x 1440 as shipped; nx2/oot_patches.py
+   apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it
+   saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; 1 and 2 ask for x1 of a 2560 x 1440 or 3840 x 2160 display. */
+static int output_mode(void) {
+    static int v = -1;
     if (v < 0) {
-        char ini_path[MAX_PATH] = "";
-        const int ini = ini_handheld(ini_path, sizeof ini_path);
-        const char *env = getenv("HOS_HANDHELD");
-        if (env) {
-            v = atoi(env) != 0;
-            if (ini >= 0 && ini != v)
-                hos_log("oe: operation mode %s (HOS_HANDHELD=%s disagrees with handheld_profile=%d in %s; the environment wins)",
-                        v ? "handheld" : "docked", env, ini, ini_path);
-            else if (ini >= 0)
-                hos_log("oe: operation mode %s (HOS_HANDHELD=%s, handheld_profile=%d in %s)", v ? "handheld" : "docked", env, ini, ini_path);
-            else
-                hos_log("oe: operation mode %s (HOS_HANDHELD=%s, no handheld_profile in the options file)", v ? "handheld" : "docked", env);
-        } else if (ini >= 0) {
-            v = ini;
-            hos_log("oe: operation mode %s (handheld_profile=%d in %s, HOS_HANDHELD unset)", v ? "handheld" : "docked", ini, ini_path);
-        } else {
-            v = 0;
-            hos_log("oe: operation mode docked (HOS_HANDHELD unset, no handheld_profile; looked at %s)", ini_path[0] ? ini_path : "no options path");
-        }
+        v = getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0);
+        if (v < 0 || v > 2 || handheld()) v = 0;
+        hos_log("oe: output resolution %s", v == 2 ? "3840x2160" : v == 1 ? "2560x1440" : "2048x1152 (the game's)");
     }
+    return v;
+}
+uint32_t hos_output_size(int height) { return output_mode() == 2 ? (height ? 2160 : 3840) : (height ? 1440 : 2560); }
+/* (hookshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
+   the 4K output ran out of it. Scaled with the output's pixels; HOS_RT_POOL_MB=<MB> over it */
+uint64_t hos_rt_pool_size(uint64_t game) {
+    const char *e = getenv("HOS_RT_POOL_MB");
+    const uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
+    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    static int logged;
+    if (!logged++) hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
     return v;
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(handheld() ? 0 : 1); }     /* OperationMode_Handheld / _Console (docked) */
@@ -382,6 +382,7 @@ HLE(_ZN2nn2oe23GetCurrentGraphicsScaleEv) {
     uint32_t bits;
     memcpy(&bits, &one, 4);
     c->vreg[0][0] = bits, c->vreg[0][1] = 0;
+    c->x[0] = output_mode() ? 0 : 1;   /* (the scale enum the game reads, w0: x1 for a chosen output, x0.8 as before) */
 }
 HLE(_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb) {}
 HLE(_ZN2nn2oe31EnterExitRequestHandlingSectionEv) {}

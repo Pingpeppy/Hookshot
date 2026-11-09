@@ -362,7 +362,7 @@ bool create_device() {
     mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;   // (not used)
     dev.mesh_shader = dev.mesh_shader && mesh.meshShader && mesh.taskShader;
     // RX_VK_MESH_FALLBACK=1: the issue 640 compute path even when the device has mesh shaders (a backup when the
-    // driver's mesh compiler faults). Off unless that variable is set. Upstream reverted that fallback; this branch keeps it.
+    // driver's mesh compiler faults). Off unless that variable is set. GPUs without mesh shaders take the same path.
     const bool force_mesh_fallback = [] {
         const char* e = getenv("RX_VK_MESH_FALLBACK");
         return e && e[0] && std::atoi(e) != 0;
@@ -1034,7 +1034,7 @@ bool started_up() {
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
         part = 0;
-        const bool prepared = prepare_run(progress);
+        const bool prepared = prepare_run(progress, false);
         part = 1;
         if (prepared) predict_run(progress);
         part = 2;
@@ -1081,8 +1081,11 @@ bool started_up() {
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
         splash_progress(0, 0);
-        if (prepare_run(progress)) predict_run(progress);
+        const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
+        if (!update && prepare_run(progress, false)) predict_run(progress);
+        if (update) state_list_run();
         precompile_run(progress);
+        if (update) prepare_background();
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
         splash_stop();
         prep_title(1, 1, "Hookshot");
@@ -1215,7 +1218,8 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
              "RX_VK_LOW_TEX=0, RX_VK_LOW_STAGING=0 and RX_VK_LOW_COMPILE=0 turn those off. RX_VK_LOW_MEM=0 turns them all off.");
     if (!dev.mesh_shader && !dev.mesh_fallback && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
-        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on)
+        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on.)
+        // (a GPU with no buffer device addresses has no fallback to run either)
         logf("vk: this GPU has no mesh shaders: the game's foliage, grass and many effects cannot be drawn");
 #ifdef _WIN32
         std::thread([name = std::string(dev.props.deviceName)] {

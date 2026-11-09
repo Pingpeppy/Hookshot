@@ -122,8 +122,16 @@ def main():
         raise SystemExit("a payload a task did not write is not cleared before the mesh dispatch")
     if "VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT" not in VMA.read_text(encoding="utf-8"):
         raise SystemExit("the allocator does not make the fallback's buffers addressable")
-    if "if (st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT)" not in draw:
+    if "st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)" \
+            not in draw:
         raise SystemExit("the graphics pipeline still takes the compute stages")
+    # (a GPU with mesh shaders: the task and mesh stages are the graphics pipeline's own. Left out of a native mesh program,
+    # its pipeline was its fragment stage alone, drew none of the grass, leaves or terrain and then lost the device)
+    graphics = block(draw, "VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, "
+                           "VkPrimitiveTopology topo, int part) {")
+    if "if (p.fallback && (st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |" \
+            not in graphics:
+        raise SystemExit("build_graphics leaves out the task and mesh stages of native mesh programs too")
     if "mesh pipeline includes the task and mesh stages" not in draw:
         raise SystemExit("a native mesh pipeline does not keep its task and mesh stages")
     if "dynamic_state(cmd, s, at, topo, d.mesh && !p.fallback);" not in draw:

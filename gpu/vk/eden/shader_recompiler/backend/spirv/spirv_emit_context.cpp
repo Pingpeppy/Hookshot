@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -2306,6 +2307,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
+                if (position_invariant) Decorate(output_position, spv::Decoration::Invariant);   // (amd-fix, mma_layout.h)
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
@@ -2322,6 +2324,22 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.vertex_lines) {
         mesh_vertex_targets.push_back(target(line, false));
     }
+    // (hookshot) A component of a generic output no line writes was undefined at the fragment stage (the console's: 0, and 1 for .w,
+    // as the vertex stage's defaults here). The foliage is drawn by mesh programs: neon plants. RX_VK_MESH_NO_DEFAULTS=1: as before
+    if (!std::getenv("RX_VK_MESH_NO_DEFAULTS")) {
+        std::array<u32, IR::NUM_GENERICS> written{};
+        for (const u32 line : mesh_info.vertex_lines) {
+            const IR::Attribute attribute{line};
+            if (IR::IsGeneric(attribute)) {
+                written[IR::GenericAttributeIndex(attribute)] |= 1U << IR::GenericAttributeElement(attribute);
+            }
+        }
+        for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+            if (Sirit::ValidId(generics[0][index]) && written[index] != 0xF) {
+                mesh_vertex_defaults.push_back({generics[0][index], 0xFU & ~written[index]});
+            }
+        }
+    }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
@@ -2336,6 +2354,7 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        if (position_invariant) Decorate(output_position, spv::Decoration::Invariant);   // (amd-fix, mma_layout.h)
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {
