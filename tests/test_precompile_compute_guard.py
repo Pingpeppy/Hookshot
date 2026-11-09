@@ -42,6 +42,7 @@ struct VkComputePipelineCreateInfo {
  uintptr_t layout=0;
 };
 struct {uintptr_t device=0x1234;}dev;
+struct PipelineCreateLock {};
 VkPipelineCache pcache=0x5678;
 struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;};
 struct Pre {std::mutex mu;bool abandoned=false;};
