@@ -16,7 +16,7 @@ def main():
     host = (ROOT / "host/nn_applet.c").read_text(encoding="utf-8")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     posix = ROOT / "host" / "posix"
-    use_posix_win = (posix / "windows.h").is_file()
+    use_posix_win = os.name != "nt" and (posix / "windows.h").is_file()
     win_inc = '#include "windows.h"\n' if use_posix_win else "#include <windows.h>\n"
     path_stub = (
         "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
         source, exe = work / "fixture.cpp", work / "fixture.exe"
         source.write_text(fixture, encoding="utf-8")
         cxx_flags = ["-std=c++17"]
-        if (posix / "windows.h").is_file():
+        if use_posix_win:
             cxx_flags += ["-I" + str(posix), "-D_GNU_SOURCE"]
         subprocess.run([args.cxx, *cxx_flags, str(source), "-o", str(exe)], check=True)
         for saved, handheld, override, mode, w, h, label in cases:
