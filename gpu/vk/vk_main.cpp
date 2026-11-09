@@ -621,8 +621,9 @@ void splash_free_buffer() {
 }
 
 void splash_stop() {
+    // A short wait destroyed the fence while the first present was still in it (gamescope, a slow queue).
     if (splash.busy && splash.fence)
-        vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 500000000ull);
+        vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, UINT64_MAX);
     splash.busy = false;
     splash_free_buffer();
     if (splash.acquired) vkDestroySemaphore(dev.device, splash.acquired, nullptr);
@@ -734,8 +735,66 @@ void splash_title(const char* text) {
 // Set while the RADV driver thread is inside an ICD call. A queue submit then waits on the device
 // lock that call holds, and the wait loop (the stall watchdog, the progress log) never runs.
 std::atomic<int> radv_on_driver{0};
+// The progress bar asks for a turn. The driver thread, between creates, sets splash_yield and waits
+// briefly so the bar can present without submitting during a compile.
+std::atomic<int> splash_want{0};
+std::atomic<int> splash_yield{0};
+
+// The acquire succeeded and this call will not present. Submit a wait on the acquire semaphore and
+// present, so the semaphore can be used again and the swapchain image is not held.
+bool splash_release(uint32_t index) {
+    if (index >= dev.swap_images.size() || index >= dev.swap_rendered.size() || !dev.swap_rendered[index] || !splash.cmd)
+        return false;
+    vkResetCommandPool(dev.device, splash.pool, 0);
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(splash.cmd, &cbbi) != VK_SUCCESS) return false;
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = dev.swap_images[index];
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(splash.cmd, &di);
+    if (vkEndCommandBuffer(splash.cmd) != VK_SUCCESS) return false;
+    VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    wait.semaphore = splash.acquired;
+    wait.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    signal.semaphore = dev.swap_rendered[index];
+    signal.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkCommandBufferSubmitInfo cbs{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbs.commandBuffer = splash.cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.waitSemaphoreInfoCount = 1;
+    submit.pWaitSemaphoreInfos = &wait;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cbs;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signal;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &dev.swap_rendered[index];
+    present.swapchainCount = 1;
+    present.pSwapchains = &dev.swapchain;
+    present.pImageIndices = &index;
+    std::lock_guard qk(dev.present_mu);
+    queue_flush_locked();
+    if (vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) != VK_SUCCESS) return false;
+    vkQueuePresentKHR(dev.queue, &present);
+    splash.busy = true;
+    return true;
+}
 
 // A clear plus one small copy. No pipeline is built, so this does not join the shader compiles.
+// Desktop release builds draw this too (precompile_wanted is a release build, or RX_VK_PRECOMPILE).
+// On Windows the PeekMessageA below pumps this thread's queue so the window, created on this thread,
+// paints during prep. Linux leaves window events to the display thread. The picture size is unchanged
+// on desktop; the progress window is the new behaviour.
 void splash_progress(size_t done, size_t total) {
     if (dev.offscreen || !dev.swapchain) return;
 #ifdef _WIN32
@@ -773,16 +832,32 @@ void splash_progress(size_t done, size_t total) {
     char both[160];
     snprintf(both, sizeof both, "%s%s%s", line, eta[0] ? " — " : "", eta);
     splash_title(both);
-    if (radv_on_driver.load(std::memory_order_acquire) != 0) return;
-    if (!splash_init()) return;
+    splash_want.store(1, std::memory_order_release);
+    // A submit during a compile blocks on the device lock that compile holds, and the precompile
+    // wait (its log, its stall watchdog) stops with it. The driver thread yields between creates.
+    const bool turn = splash_yield.load(std::memory_order_acquire) != 0 || radv_on_driver.load(std::memory_order_acquire) == 0;
+    if (!turn) return;
+    if (!splash_init()) {
+        splash_want.store(0, std::memory_order_release);
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
     const int pct = total ? (int)(done * 100 / total) : -1;
     if (splash.last_draw.time_since_epoch().count() != 0 && now - splash.last_draw < std::chrono::milliseconds(250) &&
-        pct == splash.last_pct)
+        pct == splash.last_pct) {
+        splash_yield.store(0, std::memory_order_release);
         return;
-    if (splash.busy && vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 0) != VK_SUCCESS) return;
+    }
+    if (splash.busy && vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 0) != VK_SUCCESS) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
     const uint32_t width = dev.swap_extent.width, height = dev.swap_extent.height;
     constexpr uint32_t kBand = 56;
-    if (!width || !height || !splash_buffer(width)) return;
+    if (!width || !height || !splash_buffer(width)) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
     const uint32_t band = std::min(kBand, height);
     const bool bgra = dev.swap_format == VK_FORMAT_B8G8R8A8_UNORM;
     uint8_t bg[4] = {18, 20, 26, 255};
@@ -818,15 +893,23 @@ void splash_progress(size_t done, size_t total) {
     const uint64_t acquire_ns = splash.last_draw.time_since_epoch().count() == 0 ? 100000000ull : 0ull;
     uint32_t index = 0;
     const VkResult got = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_ns, splash.acquired, VK_NULL_HANDLE, &index);
-    if (got == VK_TIMEOUT || got == VK_NOT_READY || got == VK_ERROR_OUT_OF_DATE_KHR) return;
-    if ((got != VK_SUCCESS && got != VK_SUBOPTIMAL_KHR) || index >= dev.swap_images.size() || index >= dev.swap_rendered.size() ||
-        !dev.swap_rendered[index])
+    if (got == VK_TIMEOUT || got == VK_NOT_READY || got == VK_ERROR_OUT_OF_DATE_KHR) {
+        splash_yield.store(0, std::memory_order_release);
         return;
+    }
+    const bool acquired = (got == VK_SUCCESS || got == VK_SUBOPTIMAL_KHR) && index < dev.swap_images.size();
+    if (!acquired || index >= dev.swap_rendered.size() || !dev.swap_rendered[index]) {
+        if (acquired) splash_release(index);
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
     vkResetCommandPool(dev.device, splash.pool, 0);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(splash.cmd, &cbbi) != VK_SUCCESS) {
+        splash_release(index);
         splash.failed = true;
+        splash_yield.store(0, std::memory_order_release);
         return;
     }
     auto barrier = [&](VkImageLayout from, VkImageLayout to) {
@@ -858,7 +941,9 @@ void splash_progress(size_t done, size_t total) {
     vkCmdCopyBufferToImage(splash.cmd, splash.buf, dev.swap_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     if (vkEndCommandBuffer(splash.cmd) != VK_SUCCESS) {
+        splash_release(index);
         splash.failed = true;
+        splash_yield.store(0, std::memory_order_release);
         return;
     }
     VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -882,18 +967,25 @@ void splash_progress(size_t done, size_t total) {
     present.swapchainCount = 1;
     present.pSwapchains = &dev.swapchain;
     present.pImageIndices = &index;
+    bool submitted = false;
     {
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
-        if (vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) != VK_SUCCESS) {
-            splash.failed = true;
-            return;
-        }
-        vkQueuePresentKHR(dev.queue, &present);
+        submitted = vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) == VK_SUCCESS;
+        if (submitted) vkQueuePresentKHR(dev.queue, &present);
+    }
+    if (!submitted) {
+        // A failed submit does not wait on or signal the semaphores. Present the image plainly.
+        splash.failed = true;
+        splash_release(index);
+        splash_yield.store(0, std::memory_order_release);
+        return;
     }
     splash.busy = true;
     splash.last_draw = now;
     splash.last_pct = pct;
+    splash_want.store(0, std::memory_order_release);
+    splash_yield.store(0, std::memory_order_release);
 }
 
 void prep_title(size_t done, size_t total, const char* what) {
@@ -1208,6 +1300,20 @@ void radv_thread_main() {
         radv_on_driver.fetch_add(1, std::memory_order_acq_rel);
         job();
         radv_on_driver.fetch_sub(1, std::memory_order_acq_rel);
+        // Between creates, give the progress bar a moment. Submitting while this thread is inside
+        // the ICD waits on the lock that call holds, so the bar used to stay on its first frame.
+        if (splash_want.load(std::memory_order_acquire) != 0) {
+            static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(3);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(2)) {
+                last = now;
+                splash_yield.store(1, std::memory_order_release);
+                const auto until = now + std::chrono::milliseconds(100);
+                while (splash_yield.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                splash_yield.store(0, std::memory_order_release);
+            }
+        }
     }
 }
 void radv_ensure_thread() {
@@ -1216,12 +1322,16 @@ void radv_ensure_thread() {
 template <class F>
 auto radv_drive(F fn) -> decltype(fn()) {
     using R = decltype(fn());
-    // Our threads hop, so two of them never sit in the driver at once. Any other thread is RADV
-    // calling back: it runs the real entry point here. Waiting for this thread would deadlock,
-    // because this thread is inside the call the compile thread is part of (or the next one, which
-    // needs the lock that compile thread still holds). That is the stall after a cold prep: the
-    // workers have joined, then the first shader-module create of the precompile never returns.
-    if (on_radv_thread || !radv_app_thread) return fn();
+    // Re-entry from this thread runs here. Every other call, including one from a thread that never
+    // took PipelineCreateLock, waits its turn on this thread. The hooks are only our vkx:: table, so
+    // a RADV compile thread does not call them; running an unmarked thread of ours inline was the
+    // concurrency the driver thread exists to stop. The log says when that happens.
+    if (on_radv_thread) return fn();
+    if (!radv_app_thread) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 4)
+            logf("vk: radv: an unmarked thread's driver call is queued on the driver thread");
+    }
     radv_ensure_thread();
     auto prom = std::make_shared<std::promise<R>>();
     std::future<R> fut = prom->get_future();

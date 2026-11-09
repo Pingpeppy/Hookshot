@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "vk_texture.h"
+#include "vk_retire.h"
 #include "vk_menu.h"
 #include "vk_draw.h"
 #include "vk_gprof.h"
@@ -3242,6 +3243,7 @@ void texture_frame(uint64_t completed) {
         vma_heap_account(&heap_before, &blocks, &alloc, &free_b, &sys_u, &sys_b, &sys_a);
     }
     size_t kept_gpu = 0;
+    uint64_t kept_bytes = 0;
     for (auto& [last, tex] : order) {
         const bool baked = tex->first_written && tex->first_written == tex->last_written && tex->bytes <= (4ull << 20);
         bool overwritten = false;
@@ -3252,6 +3254,11 @@ void texture_frame(uint64_t completed) {
         const bool in_graph = tex->owned_frame == frame_no || tex->last_written == frame_no || tex->last_value > completed;
         if (frame_no - tex->last_frame < 8) continue;
         if ((tex->gpu_written || attachment) && in_graph) continue;
+        if (tex->gpu_written) {
+            auto [a, e] = by_gpu.equal_range(tex->gpu);
+            for (auto o = a; o != e && !overwritten; ++o)
+                overwritten = o->second != tex && o->second->last_written > tex->last_frame;
+        }
         if (scene_now) {
             if (tex->last_frame >= burst_at || tex->last_value > completed || baked) continue;
         } else {
@@ -3279,11 +3286,6 @@ void texture_frame(uint64_t completed) {
         // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
         // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the
         // driver's paging made submissions of seconds (5-9 fps for a minute)
-        if (tex->gpu_written) {
-            auto [a, e] = by_gpu.equal_range(tex->gpu);
-            for (auto o = a; o != e && !overwritten; ++o)
-                overwritten = o->second != tex && o->second->last_written > tex->last_frame;
-        }
         // While the textures are over the working-set budget, a render target idle for those 8 presents goes too
         // (flushed back first, below). Kept for 2 s, the old sizes stayed resident and the deck swapped.
         const bool ws_squeeze = !sweep && ws_on;
@@ -3317,19 +3319,21 @@ void texture_frame(uint64_t completed) {
         }
         // The image is the only copy when the GPU drew it and the write-back did not happen (ASTC, BC,
         // over 16 MB, or the read failed). Retiring it left the next image cleared: grass and leaves
-        // sampled white. RX_VK_EVICT_RENDERED=1: retired anyway. A scene change still drops the old one.
+        // sampled white. The same on a scene change: Kokiri to the house and back remade them empty.
+        // Desktop (not the working-set pass, and no scene purge) keeps the older time rules, so a course
+        // left behind still goes. RX_VK_EVICT_RENDERED=1 retires the GPU-written ones anyway.
+        // BC and these GPU-written images are not destroyed to chase the budget. The count below is the
+        // measure of how far over the budget that leaves the Deck; destroying them is what made the white.
         static const bool evict_rendered = getenv("RX_VK_EVICT_RENDERED") != nullptr;
-        if (!scene_now && !overwritten && tex->gpu_written && !tex->released && !evict_rendered && !wrote_back) {
+        if (keep_image_that_would_clear(ws_on, scene_now, overwritten, tex->gpu_written, tex->released, evict_rendered,
+                                        wrote_back, tex->bc)) {
+            if (tex->bc) {
+                static int logged;
+                if (logged++ < 1)
+                    logf("vk: not retiring BC images: a new one is cleared, and there is no CPU upload into BC3");
+            }
             kept_gpu++;
-            continue;
-        }
-        // A BC image has no CPU upload. Recreating it clears it, and the next draw samples that clear
-        // (Link and the leaves, solid white) when the ASTC re-encode does not land before the draw.
-        if (!scene_now && !overwritten && tex->bc) {
-            static int logged;
-            if (logged++ < 1)
-                logf("vk: not retiring BC images: a new one is cleared, and there is no CPU upload into BC3");
-            kept_gpu++;
+            kept_bytes += tex->bytes;
             continue;
         }
         watch_tex(tex, "evicted");
@@ -3355,10 +3359,14 @@ void texture_frame(uint64_t completed) {
     }
     const size_t n = order.size() - textures.size();
     if (n && kept_gpu)
-        logf("vk: %zu textures retired (%zu left, %llu MB); %zu the GPU wrote kept, no write-back", n, textures.size(),
-             (unsigned long long)(total_bytes >> 20), kept_gpu);
+        logf("vk: %zu textures retired (%zu left, %llu MB); %zu kept (%llu MB) that would come back cleared, no write-back", n,
+             textures.size(), (unsigned long long)(total_bytes >> 20), kept_gpu, (unsigned long long)(kept_bytes >> 20));
     else if (n)
         logf("vk: %zu textures retired (%zu left, %llu MB)", n, textures.size(), (unsigned long long)(total_bytes >> 20));
+    else if (kept_gpu && !sweep && (scene_now || frame_no % 600 == 0))
+        logf("vk: working set over budget (%llu of %llu MB): kept %zu images (%llu MB) that would come back cleared",
+             (unsigned long long)(total_bytes >> 20), (unsigned long long)(budget >> 20), kept_gpu,
+             (unsigned long long)(kept_bytes >> 20));
     if (scene_now) {
         bursting = false;
         for (auto it = arenas.begin(); it != arenas.end();) {

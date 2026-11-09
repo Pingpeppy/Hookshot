@@ -293,8 +293,8 @@ void save() {
         for (const Row& r : rows)
             if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
-        // host/nn_hid.c binds_load)
-        fprintf(f, "options_version=3\n");
+        // host/nn_hid.c binds_load. 4: a Deck 50% saved while the picture was 2560x1440, migrated once to 100%)
+        fprintf(f, "options_version=4\n");
         if (!can_bind()) fputs(kept.c_str(), f);
         for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
             if (i < HOS_SW_N) fprintf(f, "pad_%s=%d\n", bind_names[i], host->binding(HOS_BIND_PAD, i, 0));
@@ -768,6 +768,7 @@ void menu_init() {
     if (done) return;
     done = true;
     bool has_options = false;
+    int opt_ver = 0;
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         has_options = true;
         char line[80];
@@ -781,7 +782,7 @@ void menu_init() {
             for (Row& r : rows)
                 if (r.value && !strcmp(line, ini_key(r))) *r.value = std::min(std::max(atoi(eq + 1), r.lo), r.hi);
             has_resolution |= !strcmp(line, "resolution");
-            v2 |= !strcmp(line, "options_version");
+            if (!strcmp(line, "options_version")) v2 = true, opt_ver = atoi(eq + 1);
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
         }
         fclose(f);
@@ -800,15 +801,30 @@ void menu_init() {
     }
     if (opts.preset > 0) sync_preset_budgets(opts.preset);
     // Steam Deck OLED is a 15 W APU at 1280x800. Auto resolution stays at the game's docked size, and frame
-    // generation spends the same GPU on made frames. hos_main.c sets RX_VK_DECK. RX_VK_KEEP_RES=1 leaves Auto alone.
+    // generation spends the same GPU on made frames. hos_main.c sets RX_VK_DECK and RX_DECK_PICTURE_ON.
+    // RX_VK_KEEP_RES=1 leaves the saved resolution alone, including Auto.
     // The Deck picture is 1280x720, so the scene is already 960x540. 100% of that is the old 50% of 1920x1080.
-    // A saved 50% still halves the new scene. RX_DECK_PICTURE=0 keeps the 2560x1440 picture and the 50% default.
-    if (const char* deck = getenv("RX_VK_DECK"); deck && deck[0] != '0' && !getenv("RX_VK_KEEP_RES") && opts.resolution == 0) {
-        const char* pic = getenv("RX_DECK_PICTURE");
-        const bool old_picture = pic && pic[0] == '0' && pic[1] == '\0';
-        opts.resolution = old_picture ? 4 : 1;
-        logf("vk: deck resolution %s (picture %s; 100%% of 960x540 matches 50%% of the old 1920x1080 scene)",
-             old_picture ? "50%" : "100%", old_picture ? "2560x1440" : "1280x720");
+    // A 50% saved by a build whose picture was still 2560x1440 (options_version under 4) becomes 100% once.
+    // A 50% saved after that, or with RX_VK_KEEP_RES, stays 50%. RX_DECK_PICTURE=0 keeps the 50% default.
+    if (const char* deck = getenv("RX_VK_DECK"); deck && deck[0] != '0' && !getenv("RX_VK_KEEP_RES")) {
+        bool old_picture = false;
+        if (const char* on = getenv("RX_DECK_PICTURE_ON"))
+            old_picture = on[0] == '0';
+        else if (const char* pic = getenv("RX_DECK_PICTURE")) {
+            unsigned w = 0, h = 0;
+            const bool zero = pic[0] == '0' && pic[1] == '\0';
+            const bool parsed = sscanf(pic, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64;
+            old_picture = zero || !parsed;
+        }
+        if (opts.resolution == 0) {
+            opts.resolution = old_picture ? 4 : 1;
+            logf("vk: deck resolution %s (picture %s; 100%% of 960x540 matches 50%% of the old 1920x1080 scene)",
+                 old_picture ? "50%" : "100%", old_picture ? "2560x1440" : "1280x720");
+        } else if (!old_picture && opts.resolution == 4 && opt_ver < 4) {
+            opts.resolution = 1;
+            logf("vk: deck: saved 50%% from the 2560x1440 picture becomes 100%% of the 960x540 scene");
+            save();
+        }
     }
     if (opts.framegen == 1) opts.framegen = 2;
     if (const char* e = getenv("RX_VK_FRAMEGEN")) {

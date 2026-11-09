@@ -524,7 +524,8 @@ NV(nvnTextureBuilderSetSize2D) {
         static volatile LONG left = 24;
         if (on < 0) on = getenv("HOS_SIZE_TRACE") != NULL;
         const uint32_t w = U32(1);
-        if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920) && InterlockedDecrement(&left) >= 0) {
+        if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920 || w == 1280 || w == 960) &&
+            InterlockedDecrement(&left) >= 0) {
             void hos_backtrace(void);
             hos_log("nvn: texture size %ux%u (lr %#llx)", w, U32(2), (unsigned long long)c->x[30]);
             hos_backtrace();

@@ -1150,12 +1150,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         std::lock_guard lk(disk_mu);
         auto it = disk_records.find(key);
         if (it == disk_records.end()) return;
-        if (keep) {   // (borrowed: still on disk for play)
-            recs = it->second;
-        } else {
-            recs = std::move(it->second);
-            disk_records.erase(it);
-        }
+        recs = it->second;   // (dropped at the end, unless keep: the caller publishes, then drops)
     }
     for (const DiskRecord& d : recs) {
         std::vector<uint8_t> data(d.size);
@@ -1207,6 +1202,10 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         p->ready.store(true, std::memory_order_release);
         variants.push_back(std::move(p));
         st_cache_hits++;
+    }
+    if (!keep) {
+        std::lock_guard lk(disk_mu);
+        disk_records.erase(key);
     }
 }
 
@@ -1908,20 +1907,21 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     }
     std::sort(order.begin(), order.end());
     logf("vk: loading %zu programs from the cache, in file order", order.size());
-    std::vector<std::vector<std::unique_ptr<Program>>> fresh(order.size());
+    std::vector<Program*> loaded;
     for (size_t i = 0; i < order.size(); i++) {
         if (i == 0 || (i % 512) == 0)
             logf("vk: cache load %zu of %zu programs", i, order.size());
-        program_cache_load(order[i].second, fresh[i]); // (modules: not under shader_mu, the driver thread must not need it)
-    }
-    std::vector<Program*> loaded;
-    {
-        std::lock_guard lk(shader_mu);
-        for (size_t i = 0; i < order.size(); i++) {
+        std::vector<std::unique_ptr<Program>> fresh;
+        // keep: the disk record stays until this key is in programs, so a lookup does not miss it
+        program_cache_load(order[i].second, fresh, true); // (modules: not under shader_mu, the driver thread must not need it)
+        {
+            std::lock_guard lk(shader_mu);
             auto& variants = programs[order[i].second];
-            for (auto& p : fresh[i]) variants.push_back(std::move(p));
+            for (auto& p : fresh) variants.push_back(std::move(p));
             for (auto& p : variants) loaded.push_back(p.get());
         }
+        std::lock_guard lk(disk_mu);
+        disk_records.erase(order[i].second);
     }
     for (Program* p : loaded) fn(*p);
     if (!order.empty()) logf("vk: cache load %zu of %zu programs", order.size(), order.size());

@@ -553,20 +553,24 @@ static int game_main(int argc, char **argv) {
         const int old_size = pic && pic[0] == '0' && pic[1] == '\0';
         unsigned deck_w = 1280, deck_h = 720;
         int deck_picture = 0;
-        if (!old_size && pic && sscanf(pic, "%ux%u", &deck_w, &deck_h) == 2 && deck_w >= 64 && deck_h >= 64)
-            deck_picture = 1;
-        else if (!old_size && !pic && deck_on)
+        if (!old_size && pic && pic[0]) {
+            if (sscanf(pic, "%ux%u", &deck_w, &deck_h) == 2 && deck_w >= 64 && deck_h >= 64)
+                deck_picture = 1;
+            else
+                hos_log("boot: RX_DECK_PICTURE=%s is not 0 or WIDTHxHEIGHT: the shipped picture", pic);
+        } else if (!old_size && deck_on)
             deck_picture = 1;
         if (deck_picture) {
             deck_w = (deck_w + 4u) / 8u * 8u;
             deck_h = (deck_h + 4u) / 8u * 8u;
         }
+        setenv("RX_DECK_PICTURE_ON", deck_picture ? "1" : "0", 1);
         if (want > game * 1.01) {
             double r = want > 32.0 / 9.0 ? 32.0 / 9.0 : want;
             const unsigned oh = deck_picture ? deck_h : 1440;
             const unsigned ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
-            const unsigned sh = deck_picture ? oh * 3u / 4u : 1080;
-            const unsigned sw = deck_picture ? ow * 3u / 4u : (unsigned)(ow * 0.75 / 8 + 0.5) * 8;
+            const unsigned sh = deck_picture ? (oh * 3u / 4u + 4u) / 8u * 8u : 1080;
+            const unsigned sw = deck_picture ? (ow * 3u / 4u + 4u) / 8u * 8u : (unsigned)(ow * 0.75 / 8 + 0.5) * 8;
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;
             hos_wide_ratio = (float)ow / (float)oh;

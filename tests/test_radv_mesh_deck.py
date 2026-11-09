@@ -39,6 +39,13 @@ def main():
     MENU = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     if "old_picture ? 4 : 1" not in MENU:
         raise SystemExit("vk_menu.cpp: a 720p Deck picture defaults to 100%, and RX_DECK_PICTURE=0 keeps 50%")
+    if "opt_ver < 4" not in MENU or "options_version=4" not in MENU:
+        raise SystemExit("vk_menu.cpp: a saved 50% from before options_version 4 must become 100% once")
+    if "RX_DECK_PICTURE_ON" not in MENU or "RX_DECK_PICTURE_ON" not in MAIN:
+        raise SystemExit("the host publishes RX_DECK_PICTURE_ON and the menu reads it")
+    nvn = (ROOT / "host/nvn_native.c").read_text(encoding="utf-8")
+    if "w == 1280" not in nvn or "w == 960" not in nvn:
+        raise SystemExit("nvn_native.c: HOS_SIZE_TRACE must record the 1280 and 960 picture sizes")
     if "if (!view && !dev.null_descriptor) view = dummies.view[(int)vt]" not in DRAW:
         raise SystemExit("vk_draw.cpp: a missing view is null when nullDescriptor is on, else the dummy")
     if "image view missing and the dummy view was not made" not in DRAW or "told++ < 32" not in DRAW:
@@ -55,24 +62,41 @@ def main():
         raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
     if "one driver thread" not in VKMAIN or "install_radv_driver_thread" not in VKMAIN:
         raise SystemExit("vk_main.cpp: RADV shader and pipeline calls must run on one driver thread")
-    if "radv_app_thread" not in VKMAIN or "!radv_app_thread" not in VKMAIN:
-        raise SystemExit("vk_main.cpp: a call that is not ours must not wait on the RADV driver thread")
+    if "if (on_radv_thread) return fn();" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: only the driver thread itself may call the ICD inline")
+    if "queued on the driver thread" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: an unmarked thread must be queued, not run beside the driver thread")
+    if "on_radv_thread || !radv_app_thread" in VKMAIN:
+        raise SystemExit("vk_main.cpp: the unmarked-thread bypass must stay out")
     if "in file order" not in SHADER:
         raise SystemExit("vk_shader.cpp: the program cache must be loaded in file order after prep")
+    load_some = SHADER[SHADER.index("size_t program_cache_load_some"):SHADER.index("void program_cache_borrow")]
+    if load_some.index("programs[") > load_some.index("disk_records.erase"):
+        raise SystemExit("vk_shader.cpp: a loaded program must be published before its disk record is dropped")
     if "nothing to build" not in DRAW:
         raise SystemExit("vk_draw.cpp: an empty predict must log, not go silent after prepared")
     if "of %zu pipelines" not in DRAW:
         raise SystemExit("vk_draw.cpp: precompile must log how many pipelines have finished")
+    worker_at = DRAW.index("const auto worker = [pre, total]")
+    worker = DRAW[worker_at:DRAW.index("std::vector<std::thread> threads;", worker_at)]
+    if worker.index("if (pre->abandoned) return;") > worker.index("pre->next++"):
+        raise SystemExit("vk_draw.cpp: an abandoned precompile must stop claiming jobs before next++")
     if "no write-back" not in TEX:
         raise SystemExit("vk_texture.cpp: a GPU-written texture with no write-back must stay resident")
     if "RX_VK_RETIRE" not in TEX or "working-set retirement off (RX_VK_WS_BUDGET=0)" not in TEX:
         raise SystemExit("vk_texture.cpp: RX_VK_WS_BUDGET=0 and RX_VK_RETIRE=0 must skip the retire pass")
     if "frame_no - tex->last_frame < 8" not in TEX or "in_graph" not in TEX:
         raise SystemExit("vk_texture.cpp: the last 8 presents and this frame's render targets must not be retired")
-    if "not retiring BC images" not in TEX:
+    if "not retiring BC images" not in TEX or "keep_image_that_would_clear" not in TEX:
         raise SystemExit("vk_texture.cpp: BC images must not be retired; a new one stays cleared")
-    if "radv_on_driver" not in VKMAIN:
-        raise SystemExit("vk_main.cpp: the progress bar must not submit while the RADV driver thread is in a create")
+    if "would come back cleared" not in TEX:
+        raise SystemExit("vk_texture.cpp: images kept because they would come back cleared must be counted")
+    if "radv_on_driver" not in VKMAIN or "splash_yield" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: the progress bar must not submit during a create, and the driver thread must yield for it")
+    if "UINT64_MAX" not in VKMAIN or "splash_release" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: splash must wait out its fence and present an image it acquired")
+    if "Desktop release builds draw this too" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: the desktop progress window must be named")
     if "Preparing shaders:" not in VKMAIN or "splash_progress" not in VKMAIN:
         raise SystemExit("vk_main.cpp: shader prep must draw Preparing shaders: N / total on the window")
     if "predicting pipelines from" not in DRAW or "startup_driver_threads" not in DRAW:

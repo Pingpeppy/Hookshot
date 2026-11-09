@@ -6028,7 +6028,14 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         auto& notes = pre->notes;
         auto& computes = pre->computes;
         for (;;) {
-            const size_t i = pre->next++;
+            // Once the watchdog has given up, stop taking jobs. The ones already inside the driver finish.
+            // Claiming the rest left the game's own creates queued behind a full precompile.
+            size_t i;
+            {
+                std::lock_guard lk(pre->mu);
+                if (pre->abandoned) return;
+                i = pre->next++;
+            }
             if (i >= total) return;
             if (i < computes.size()) {
                 Program& p = *computes[i];
