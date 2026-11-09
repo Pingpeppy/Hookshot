@@ -25,8 +25,7 @@ def main():
         if use_posix_win
         else "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
     )
-    fixture = r'''
-''' + win_inc + path_stub + r'''#include <algorithm>
+    fixture = "#define WIN32_LEAN_AND_MEAN\n#define NOMINMAX\n" + win_inc + r'''#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -43,7 +42,7 @@ int upscaler() { return up_now; }
 #include "gpu/vk/upscaler_rows.h"
 using namespace mkwvk;
 namespace ur = upscaler_rows;
-''' + host[host.index("static int ini_option_at("):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
+''' + path_stub + host[host.index("static int ini_option_at("):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
         menu.index("struct Out {"):menu.index("/// The Render resolution: the value chosen")] + menu[
         menu.index("const char* tx_output_res("):menu.index("const char* tx_speed(")] + r'''
 int main(int argc, char **argv) {
