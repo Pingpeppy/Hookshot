@@ -607,6 +607,11 @@ struct Splash {
 };
 Splash splash;
 
+// The progress bar asks for a turn. The driver thread, between creates, sets splash_yield and waits
+// briefly so the bar can present without submitting during a compile. splash_stop clears both.
+std::atomic<int> splash_want{0};
+std::atomic<int> splash_yield{0};
+
 void splash_free_buffer() {
     if (splash.mem) {
         auto unmap = (PFN_vkUnmapMemory)vkGetDeviceProcAddr(dev.device, "vkUnmapMemory");
@@ -634,6 +639,10 @@ void splash_stop() {
     splash.pool = VK_NULL_HANDLE;
     splash.cmd = VK_NULL_HANDLE;
     splash.ready = false;
+    // The driver thread yields only while this is set. Leaving it set after prep waits ~100 ms
+    // every couple of seconds on later compiles.
+    splash_want.store(0, std::memory_order_release);
+    splash_yield.store(0, std::memory_order_release);
 }
 
 bool splash_init() {
@@ -735,10 +744,6 @@ void splash_title(const char* text) {
 // Set while the RADV driver thread is inside an ICD call. A queue submit then waits on the device
 // lock that call holds, and the wait loop (the stall watchdog, the progress log) never runs.
 std::atomic<int> radv_on_driver{0};
-// The progress bar asks for a turn. The driver thread, between creates, sets splash_yield and waits
-// briefly so the bar can present without submitting during a compile.
-std::atomic<int> splash_want{0};
-std::atomic<int> splash_yield{0};
 
 // The acquire succeeded and this call will not present. Submit a wait on the acquire semaphore and
 // present, so the semaphore can be used again and the swapchain image is not held.

@@ -6105,7 +6105,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
             std::lock_guard lk(pre->mu);
             pre->abandoned = true;
             gone_on = true;
-            logf("vk: precompile: %zu of %zu done, nothing finished for %d s: the game starts, the rest go on behind it", done.load(),
+            logf("vk: precompile: %zu of %zu done, nothing finished for %d s: the game starts, the rest are left", done.load(),
                  total, stall_s);
             break;
         }
