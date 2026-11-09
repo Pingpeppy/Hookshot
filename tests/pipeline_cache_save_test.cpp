@@ -101,6 +101,10 @@ int save_replace(const char* from, const char* to, unsigned flags) {
 
 #define fwrite save_fwrite
 #define MoveFileExA save_replace
+struct PipelineCreateLock {
+    PipelineCreateLock() {}
+    ~PipelineCreateLock() {}
+};
 #include "pipeline_cache_save.inc"
 #undef MoveFileExA
 #undef fwrite

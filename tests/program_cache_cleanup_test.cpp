@@ -83,6 +83,10 @@ FILE* disk_idx = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 std::atomic<int64_t> st_cache_hits{0};
+struct PipelineCreateLock {
+    PipelineCreateLock() {}
+    ~PipelineCreateLock() {}
+};
 #define PROF_EXACT()   // (vk_prof.h's exact-timing scope, since #989: nothing to time here)
 #include "cache_functions.inc"
 
