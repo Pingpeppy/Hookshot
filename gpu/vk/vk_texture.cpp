@@ -3182,7 +3182,13 @@ void texture_frame(uint64_t completed) {
         logf("vk: verify %ux%u: %d textures, %d changed since uploaded, %d of them unnoticed", verify_dim().first,
              verify_dim().second, checked, changed, missed);
     }
-    static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
+    // RX_VK_RETIRE=0 turns the retire pass off. RX_VK_NO_EVICT is the same switch.
+    // The 7e2f14f pass is the working-set one. RX_VK_WS_BUDGET=0 used to leave it running against the
+    // 896 MB cap, which is still over budget in Kokiri, so Link and the foliage were retired anyway.
+    static const bool retire_off = [] {
+        if (const char* e = getenv("RX_VK_RETIRE")) return e[0] == '0';
+        return getenv("RX_VK_NO_EVICT") != nullptr;
+    }();
     static const bool scene_off = getenv("RX_VK_SCENE_PURGE") && getenv("RX_VK_SCENE_PURGE")[0] == '0';
     bool scene_now = false;
     static bool bursting = false;
@@ -3202,7 +3208,17 @@ void texture_frame(uint64_t completed) {
     }
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
     const bool sweep = total_bytes <= budget;
-    if (!scene_now && (no_evict || (sweep && frame_no % 600))) return;
+    if (retire_off) {
+        static int logged;
+        if (logged++ < 1) logf("vk: texture retirement off (RX_VK_RETIRE=0)");
+        return;
+    }
+    if (!scene_now && low_mem_on(nullptr) && !ws_on) {
+        static int logged;
+        if (logged++ < 1) logf("vk: working-set retirement off (RX_VK_WS_BUDGET=0)");
+        return;
+    }
+    if (!scene_now && (sweep && frame_no % 600)) return;
     std::vector<std::pair<uint64_t, Texture*>> order;
     order.reserve(textures.size());
     for (auto& kv : textures) order.push_back({kv.second->last_ms, kv.second.get()});
@@ -3229,6 +3245,13 @@ void texture_frame(uint64_t completed) {
     for (auto& [last, tex] : order) {
         const bool baked = tex->first_written && tex->first_written == tex->last_written && tex->bytes <= (4ull << 20);
         bool overwritten = false;
+        // Last 8 presents, whatever the sort. The old test broke out of a list ordered by wall time, so a
+        // texture used six frames ago (more than a second, at this fps) was retired before that break.
+        // A render target of this frame is one the pass rendered into, or a recording that has not finished.
+        const bool attachment = (tex->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0;
+        const bool in_graph = tex->owned_frame == frame_no || tex->last_written == frame_no || tex->last_value > completed;
+        if (frame_no - tex->last_frame < 8) continue;
+        if ((tex->gpu_written || attachment) && in_graph) continue;
         if (scene_now) {
             if (tex->last_frame >= burst_at || tex->last_value > completed || baked) continue;
         } else {
@@ -3240,7 +3263,7 @@ void texture_frame(uint64_t completed) {
         // Over the working-set budget the keep is the same 8 presents the budget is built from. 90 presents kept
         // about a second of idle textures (the run sat ~800 MB over its budget and swapped).
         const uint64_t keep_frames = !sweep && ws_on ? 8 : min_presents;
-        if (ws_on && frame_no - tex->last_frame < keep_frames) break;
+        if (frame_no - tex->last_frame < keep_frames) continue;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3297,6 +3320,15 @@ void texture_frame(uint64_t completed) {
         // sampled white. RX_VK_EVICT_RENDERED=1: retired anyway. A scene change still drops the old one.
         static const bool evict_rendered = getenv("RX_VK_EVICT_RENDERED") != nullptr;
         if (!scene_now && !overwritten && tex->gpu_written && !tex->released && !evict_rendered && !wrote_back) {
+            kept_gpu++;
+            continue;
+        }
+        // A BC image has no CPU upload. Recreating it clears it, and the next draw samples that clear
+        // (Link and the leaves, solid white) when the ASTC re-encode does not land before the draw.
+        if (!scene_now && !overwritten && tex->bc) {
+            static int logged;
+            if (logged++ < 1)
+                logf("vk: not retiring BC images: a new one is cleared, and there is no CPU upload into BC3");
             kept_gpu++;
             continue;
         }

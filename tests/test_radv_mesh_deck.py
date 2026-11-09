@@ -58,6 +58,12 @@ def main():
         raise SystemExit("vk_draw.cpp: precompile must log how many pipelines have finished")
     if "no write-back" not in TEX:
         raise SystemExit("vk_texture.cpp: a GPU-written texture with no write-back must stay resident")
+    if "RX_VK_RETIRE" not in TEX or "working-set retirement off (RX_VK_WS_BUDGET=0)" not in TEX:
+        raise SystemExit("vk_texture.cpp: RX_VK_WS_BUDGET=0 and RX_VK_RETIRE=0 must skip the retire pass")
+    if "frame_no - tex->last_frame < 8" not in TEX or "in_graph" not in TEX:
+        raise SystemExit("vk_texture.cpp: the last 8 presents and this frame's render targets must not be retired")
+    if "not retiring BC images" not in TEX:
+        raise SystemExit("vk_texture.cpp: BC images must not be retired; a new one stays cleared")
     if "radv_on_driver" not in VKMAIN:
         raise SystemExit("vk_main.cpp: the progress bar must not submit while the RADV driver thread is in a create")
     if "Preparing shaders:" not in VKMAIN or "splash_progress" not in VKMAIN:
