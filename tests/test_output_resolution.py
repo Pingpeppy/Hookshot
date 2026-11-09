@@ -23,8 +23,7 @@ def main():
         "DWORD GetModuleFileNameA(void *m, char *path, DWORD cap) {\n"
         "    (void)m; return (DWORD)snprintf(path, cap, \"./hookshot.exe\"); }\n"
         if use_posix_win
-        else "using DWORD = unsigned long;\nconstexpr int MAX_PATH = 260;\n"
-             "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
+        else "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
     )
     fixture = r'''
 ''' + win_inc + path_stub + r'''#include <algorithm>
