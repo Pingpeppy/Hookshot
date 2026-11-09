@@ -945,7 +945,7 @@ bool started_up() {
         logf("vk: the shaders' preparation was skipped at the build: left to when each is first drawn");
         return true;
     }
-    if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
+    if (precompile_wanted()) {   // (a release build, preparing shaders before the game: nothing to build during play)
         // (the window is already open, but nothing has been presented, so it stays blank until the progress bar below)
         static HANDLE console = nullptr;
         const auto progress = [](size_t done, size_t total) {
@@ -1153,6 +1153,10 @@ bool radv_driver() {
 
 namespace {
 std::mutex pipeline_create_mu;
+// Set on threads of ours before they call the driver. A thread that never sets it is the driver's
+// own (a compile thread calling back into a hooked entry point) and must not wait on us.
+thread_local bool radv_app_thread = false;
+void radv_note_app_thread() { radv_app_thread = true; }
 }
 bool pipeline_creates_serialized() {
     if (!dev.physical) return false;
@@ -1164,6 +1168,7 @@ bool pipeline_creates_serialized() {
     return on;
 }
 PipelineCreateLock::PipelineCreateLock() {
+    radv_note_app_thread();
     if (!pipeline_creates_serialized()) return;
     pipeline_create_mu.lock();
     held = true;
@@ -1203,7 +1208,12 @@ void radv_ensure_thread() {
 template <class F>
 auto radv_drive(F fn) -> decltype(fn()) {
     using R = decltype(fn());
-    if (on_radv_thread) return fn();
+    // Our threads hop, so two of them never sit in the driver at once. Any other thread is RADV
+    // calling back: it runs the real entry point here. Waiting for this thread would deadlock,
+    // because this thread is inside the call the compile thread is part of (or the next one, which
+    // needs the lock that compile thread still holds). That is the stall after a cold prep: the
+    // workers have joined, then the first shader-module create of the precompile never returns.
+    if (on_radv_thread || !radv_app_thread) return fn();
     radv_ensure_thread();
     auto prom = std::make_shared<std::promise<R>>();
     std::future<R> fut = prom->get_future();
@@ -1271,6 +1281,7 @@ void install_radv_driver_thread() {
     static bool installed = false;
     if (installed || !pipeline_creates_serialized()) return;
     installed = true;
+    radv_note_app_thread(); // the renderer thread (prep, the precompile's load, presents)
 #define RADV_INSTALL(name)                                                                                                 \
     do {                                                                                                                   \
         if (vkx::name) {                                                                                                   \

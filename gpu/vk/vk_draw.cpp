@@ -1404,7 +1404,10 @@ VkSampler sampler_for(int id, bool compare) {
         ci.pNext = &rm;
     }
     VkSampler sm = VK_NULL_HANDLE;
-    vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    {
+        PipelineCreateLock lock; // (marks this thread as ours, and keeps the create on the driver thread)
+        vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    }
     samplers.emplace(key, sm);
     return sm;
 }
@@ -6082,7 +6085,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         if (next.load() >= total + threads.size()) break;
         const auto now = std::chrono::steady_clock::now();
         if (done.load() != last_done) last_done = done.load(), last_change = now;
-        else if (stall_s > 0 && next.load() >= total && now - last_change > std::chrono::seconds(stall_s)) {
+        // The workers claim one job and block in the driver before claiming the rest, so requiring
+        // next >= total meant a stuck create never tripped this and the wait never ended.
+        else if (stall_s > 0 && now - last_change > std::chrono::seconds(stall_s)) {
             std::lock_guard lk(pre->mu);
             pre->abandoned = true;
             gone_on = true;
@@ -6106,8 +6111,14 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
 // it 1.7 GB), nor kept: each program is borrowed from hookshot_programs.bin for its pipelines and let go
 void predict_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
+    // Before the notes are read. A cold prep used to go silent here: the next line the log had was
+    // "1 background worker", and only on the warm start, which skips this.
+    logf("vk: predict: reading pipeline notes");
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
-    if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
+    if (notes.empty() || getenv("RX_VK_NO_PREDICT")) {
+        logf("vk: predict: nothing to build (%zu notes)", notes.size());
+        return;
+    }
     // (this is the quiet stretch after prep: the cache is read whole before any pipeline is built, and the workers are
     // RX_VK_PRECOMPILE_THREADS when that is set, otherwise half the CPUs. Run 9 skipped it, its cache stamp already matched)
     logf("vk: predicting pipelines from %zu notes (reading the program cache first)", notes.size());

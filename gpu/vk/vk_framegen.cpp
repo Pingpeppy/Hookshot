@@ -145,9 +145,12 @@ bool init() {
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.25f;
-    vkCreateSampler(dev.device, &si, nullptr, &fg.nearest);
-    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
-    vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
+    {
+        PipelineCreateLock lock;
+        vkCreateSampler(dev.device, &si, nullptr, &fg.nearest);
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
+    }
     fg.failed = false;
     logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
     return true;
@@ -163,7 +166,12 @@ bool init_scale() {
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = 0.25f;
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
-        if (vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS) {
+        bool made = false;
+        {
+            PipelineCreateLock lock;
+            made = vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS;
+        }
+        if (made) {
             scale.failed = false;
             return true;
         }

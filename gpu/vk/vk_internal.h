@@ -34,10 +34,12 @@ void pace_fps_cap();         // (RX_VK_FPS_CAP, before a present)
 bool radv_driver();
 bool radv_mesh_payload_barrier();
 /// RADV serializes vkCreate*Pipelines, vkGetPipelineCacheData, and the shader-module and layout
-/// creates and destroys the prep workers do beside them. Those calls run on one driver thread:
-/// a lock taken on the worker still returns while RADV's own compile thread is in the driver.
-/// The CPU translation stays outside this lock. RX_VK_PIPELINE_SERIAL=0 leaves them parallel.
-/// The mutex is not recursive, and the driver thread does not take it.
+/// creates and destroys the prep workers do beside them. Those calls from our threads run on one
+/// driver thread. A call that arrives on any other thread (RADV's own compile thread, re-entering
+/// while that driver thread is inside the ICD) runs there: queueing it would wait for the driver
+/// thread, which is waiting for the compile thread. The CPU translation stays outside this lock.
+/// RX_VK_PIPELINE_SERIAL=0 leaves them parallel. The mutex is not recursive, and the driver thread
+/// does not take it.
 bool pipeline_creates_serialized();
 void install_radv_driver_thread();
 struct PipelineCreateLock {

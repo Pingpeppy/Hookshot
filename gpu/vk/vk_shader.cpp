@@ -1140,7 +1140,8 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0))});
 }
 
-/// (shader_mu held) the kept variants of key go to its list, ready, once
+/// The kept variants of key go to its list, ready, once. The caller inserts them under shader_mu;
+/// this does not take it (the module create hops to the driver thread, which must not need it).
 void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool keep = false) {
     disk_init();
     if (!disk_on) return;
@@ -1891,20 +1892,40 @@ uint64_t program_cache_stamp() { return disk_stamp(); }
 /// game's programs stay on disk until a draw asks for one
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn) {
     disk_init();
-    std::vector<uint64_t> keys;
+    // File order. After a cold prep the cache is gigabytes and the Deck has just evicted it, so a
+    // walk in hash order is a long random read of the SD card with nothing logged: the stall
+    // between "prepared" and "precompile on". The records of one key were appended together.
+    std::vector<std::pair<int64_t, uint64_t>> order;
     {
         std::lock_guard lk(disk_mu);
-        for (const auto& kv : disk_records)
-            if (wanted.count(kv.first) || (!kv.second.empty() && (kv.second[0].kind & 1))) keys.push_back(kv.first);
+        order.reserve(disk_records.size());
+        for (const auto& kv : disk_records) {
+            if (kv.second.empty()) continue;
+            const bool compute = (kv.second[0].kind & 1) != 0;
+            if (!wanted.count(kv.first) && !compute) continue;
+            order.push_back({kv.second[0].at, kv.first});
+        }
     }
-    std::lock_guard lk(shader_mu);
-    size_t n = 0;
-    for (const uint64_t key : keys) {
-        auto& variants = programs[key];
-        program_cache_load(key, variants);
-        for (auto& p : variants) n++, fn(*p);
+    std::sort(order.begin(), order.end());
+    logf("vk: loading %zu programs from the cache, in file order", order.size());
+    std::vector<std::vector<std::unique_ptr<Program>>> fresh(order.size());
+    for (size_t i = 0; i < order.size(); i++) {
+        if (i == 0 || (i % 512) == 0)
+            logf("vk: cache load %zu of %zu programs", i, order.size());
+        program_cache_load(order[i].second, fresh[i]); // (modules: not under shader_mu, the driver thread must not need it)
     }
-    return n;
+    std::vector<Program*> loaded;
+    {
+        std::lock_guard lk(shader_mu);
+        for (size_t i = 0; i < order.size(); i++) {
+            auto& variants = programs[order[i].second];
+            for (auto& p : fresh[i]) variants.push_back(std::move(p));
+            for (auto& p : variants) loaded.push_back(p.get());
+        }
+    }
+    for (Program* p : loaded) fn(*p);
+    if (!order.empty()) logf("vk: cache load %zu of %zu programs", order.size(), order.size());
+    return loaded.size();
 }
 
 /// (hookshot) Program key's kept variants made for fn, then let go (modules and layouts): the records stay for play

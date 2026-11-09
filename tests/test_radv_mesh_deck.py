@@ -48,6 +48,12 @@ def main():
         raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
     if "one driver thread" not in VKMAIN or "install_radv_driver_thread" not in VKMAIN:
         raise SystemExit("vk_main.cpp: RADV shader and pipeline calls must run on one driver thread")
+    if "radv_app_thread" not in VKMAIN or "!radv_app_thread" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: a call that is not ours must not wait on the RADV driver thread")
+    if "in file order" not in SHADER:
+        raise SystemExit("vk_shader.cpp: the program cache must be loaded in file order after prep")
+    if "nothing to build" not in DRAW:
+        raise SystemExit("vk_draw.cpp: an empty predict must log, not go silent after prepared")
     if "Preparing shaders:" not in VKMAIN or "splash_progress" not in VKMAIN:
         raise SystemExit("vk_main.cpp: shader prep must draw Preparing shaders: N / total on the window")
     if "predicting pipelines from" not in DRAW or "startup_driver_threads" not in DRAW:
