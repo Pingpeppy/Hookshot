@@ -26,6 +26,11 @@
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_synth_comp_spv.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   // (older Windows SDKs lack it: Windows 10 1803 and later take it)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 namespace mkwvk {
 extern std::atomic<uint32_t> present_kind;   // (vk_replay.cpp: the frame log's)
@@ -97,19 +102,22 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = (uint32_t)b.size();
     li.pBindings = b.data();
-    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set) != VK_SUCCESS) return false;
     const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, std::max(push, 4u)};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
     pi.pSetLayouts = &p.set;
     pi.pushConstantRangeCount = push ? 1 : 0;
     pi.pPushConstantRanges = &pr;
-    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &p.layout) != VK_SUCCESS) return false;
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = bytes;
     mi.pCode = code;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    {
+        PipelineCreateLock lock;
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set) != VK_SUCCESS) return false;
+        if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &p.layout) != VK_SUCCESS) return false;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    }
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -117,8 +125,9 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
     ci.stage.pName = "main";
     ci.stage.pSpecializationInfo = spec;
     ci.layout = p.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
-    vkDestroyShaderModule(dev.device, m, nullptr);
+    VkResult r;
+    { PipelineCreateLock lock; r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe); }
+    { PipelineCreateLock lock; vkDestroyShaderModule(dev.device, m, nullptr); }
     return r == VK_SUCCESS;
 }
 
@@ -140,9 +149,12 @@ bool init() {
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     si.maxLod = 0.25f;
-    vkCreateSampler(dev.device, &si, nullptr, &fg.nearest);
-    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
-    vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
+    {
+        PipelineCreateLock lock;
+        vkCreateSampler(dev.device, &si, nullptr, &fg.nearest);
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
+    }
     fg.failed = false;
     logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
     return true;
@@ -158,14 +170,22 @@ bool init_scale() {
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = 0.25f;
         si.magFilter = si.minFilter = VK_FILTER_LINEAR;
-        if (vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS) {
+        bool made = false;
+        {
+            PipelineCreateLock lock;
+            made = vkCreateSampler(dev.device, &si, nullptr, &scale.linear) == VK_SUCCESS;
+        }
+        if (made) {
             scale.failed = false;
             return true;
         }
     }
-    if (scale.pipe.pipe) vkDestroyPipeline(dev.device, scale.pipe.pipe, nullptr);
-    if (scale.pipe.layout) vkDestroyPipelineLayout(dev.device, scale.pipe.layout, nullptr);
-    if (scale.pipe.set) vkDestroyDescriptorSetLayout(dev.device, scale.pipe.set, nullptr);
+    {
+        PipelineCreateLock lock;
+        if (scale.pipe.pipe) vkDestroyPipeline(dev.device, scale.pipe.pipe, nullptr);
+        if (scale.pipe.layout) vkDestroyPipelineLayout(dev.device, scale.pipe.layout, nullptr);
+        if (scale.pipe.set) vkDestroyDescriptorSetLayout(dev.device, scale.pipe.set, nullptr);
+    }
     scale.pipe = {};
     return false;
 }
@@ -178,7 +198,7 @@ bool make_img(Img& i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usag
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = usage;
-    if (!create_image(ci, i.image, i.alloc)) return false;
+    if (!create_image(ci, i.image, i.alloc, false, MemTag::Present)) return false;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = i.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -213,8 +233,10 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
     }
-    queue_flush();
-    vkDeviceWaitIdle(dev.device);
+    {
+        std::lock_guard qk(dev.present_mu);   // (every queue idle: the present queue's too, device_wait_idle_locked)
+        device_wait_idle_locked();
+    }
     for (int i = 0; i < 2; i++) {
         drop_img(fg.frames[i]), drop_img(fg.lumas[i]), drop_img(fg.flows[i]);
     }
@@ -271,6 +293,20 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
     full_barrier(cmd);
 }
 
+// (hookshot) The display thread's wait for a frame's time, on a high-resolution timer. sleep_for rests on the system timer,
+// whose 1 ms (timeBeginPeriod) Windows 11 does not keep for a process whose window it takes as unseen: with the presents
+// no longer blocking (a present queue of their own) the thread slept before most frames and woke up to 20 ms after their time.
+void wait_until_near(int64_t ns) {
+    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER d;
+    d.QuadPart = -std::max<int64_t>(1, ns / 100);   // (relative, 100 ns units)
+    if (timer && SetWaitableTimerEx(timer, &d, 0, nullptr, nullptr, nullptr, 0)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+}
+
 void display_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk display");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -310,9 +346,7 @@ void display_main() {
             const int64_t now = now_ns();
             if (due < now) due = now;
             if (due > j.at + interval + step) due = j.at + interval + step;
-            if (due - now > 1000000) {
-                std::this_thread::sleep_for(std::chrono::nanoseconds(due - now - 1000000));
-            }
+            if (due - now > 1000000) wait_until_near(due - now - 1000000);
             while (now_ns() < due) SwitchToThread();
             const int64_t t = now_ns();
             present_kind.store(k < j.set->made ? 1 : 0);
@@ -359,8 +393,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         if (scale.cropped_w != cw || scale.cropped_h != ch) {
             {
                 std::lock_guard qk(dev.present_mu);
-                queue_flush_locked();
-                vkDeviceWaitIdle(dev.device);
+                device_wait_idle_locked();
             }
             drop_img(scale.cropped);
             scale.cropped_w = scale.cropped_h = 0;
@@ -383,8 +416,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     if (scale.scaled_w != dw || scale.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
-            queue_flush_locked();
-            vkDeviceWaitIdle(dev.device);
+            device_wait_idle_locked();
         }
         drop_img(scale.scaled);
         scale.scaled_w = scale.scaled_h = 0;
@@ -401,7 +433,8 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     static bool reported = false;
     if (report && !reported) {
         reported = true;
-        logf("vk: upscale dispatched: mode %d, sharpness %d, source %ux%u, crop request %d,%d %dx%d, destination %ux%u",
+        logf("vk: upscale dispatched: mode %d, sharpness %d%% (of RCAS's strongest, neighbours one source pixel apart), source %ux%u, "
+             "crop request %d,%d %dx%d, destination %ux%u",
              opts.upscale, opts.sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
              crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh);
     }

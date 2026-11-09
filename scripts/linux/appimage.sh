@@ -22,7 +22,7 @@ PY=$DEPS/python/bin/python3
 # ---- the Vulkan back end, built here once (it needs no game) ----
 VKW=$B/vk-work
 rm -rf "$VKW/sa/build/hookshot_vk.so"
-OOT_WORK=$VKW RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
+OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
 VK=$VKW/sa/build/hookshot_vk.so
 [ -f "$VK" ] || { echo "hookshot_vk.so was not built"; exit 1; }
 
@@ -47,7 +47,9 @@ printf '%s
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
 cp -a builder/linux "$T/builder/"
 cp -a gpu/render/*.h "$T/gpu/render/"
-cp -a gpu/vk/vk_api.h "$T/gpu/vk/"
+# (every gpu/vk header the host's sources include: v2.0.6 shipped without oot_cheat_items.h and no Linux build finished, issue 990.
+# tests/test_appimage_headers.py checks that this covers what host/ includes)
+for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h" ]; then cp -a "$h" "$T/gpu/vk/"; fi; done
 cp -a third_party/opus "$T/third_party/"
 mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit"
 cp -a third_party/zbic/zbic.so third_party/zbic/LICENSE third_party/zbic/PROVENANCE.md "$T/third_party/zbic/"
@@ -55,13 +57,14 @@ cp -a third_party/a64-kit/* "$T/third_party/a64-kit/"
 rm -f "$T/third_party/a64-kit/tools/lld-link.exe"
 if [ -d work ]; then
     mkdir -p "$T/work/image"
-    for f in hot_funcs.txt hot_order.txt hookshot_pieces.prof; do [ -f "work/$f" ] && cp "work/$f" "$T/work/"; done
+    for f in hot_funcs.txt hot_order.txt hookshot_pieces.prof pipeline_states.bin; do [ -f "work/$f" ] && cp "work/$f" "$T/work/"; done
     [ -f work/image/chunks.txt ] && cp work/image/chunks.txt "$T/work/image/"
 fi
 find "$T" -name __pycache__ -prune -exec rm -rf {} +
 
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
+cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
@@ -106,6 +109,9 @@ cp builder/linux/hookshot-builder.desktop "$APPDIR/"
 cp assets/hookshot.png "$APPDIR/hookshot.png"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp assets/hookshot.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hookshot.png"
+
+# (the update list, beside AppRun and not inside a hashed part: hookshot-linux.txt names each part's checksum)
+python3 scripts/linux/make_parts.py "$APPDIR" "$VERSION" "$B/parts"
 
 OUT=$B/Hookshot-$VERSION-x86_64.AppImage
 rm -f "$OUT"

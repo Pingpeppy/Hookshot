@@ -47,8 +47,20 @@ void hos_mem_init(uint64_t image_end) {
     hos_log("memory: %llu MB for the game (window %llu MB)", (unsigned long long)(hos_total_memory >> 20),
             (unsigned long long)(HOS_SPACE_END >> 20));
 #else
-    /* mkw-recomp: a Switch 2 application gets 9809 MB (Eglantine's KSystemControl, 12 GB arrangement) */
-    hos_total_memory = (mb ? strtoull(mb, NULL, 0) : 9809ULL) << 20;
+    /* mkw-recomp: a Switch 2 application gets 9809 MB (Eglantine's KSystemControl, 12 GB arrangement).
+       4608 MB, the Deck's old reported size, fails an allocation during the first submit. The game then
+       reads a null pointer (guest lr 0x80f20734, host fault at 0). The Deck keeps 9809. RX_VK_LOW_HEAP=1
+       is the 4608 MB opt-in. HOS_MEMORY_MB overrides either number. */
+    unsigned long long total_mb = 9809ULL;
+    if (!mb) {
+        const char *heap = getenv("RX_VK_LOW_HEAP");
+        if (heap && heap[0] != '0' && atoi(heap) != 0) total_mb = 4608ULL;
+    }
+    hos_total_memory = (mb ? strtoull(mb, NULL, 0) : total_mb) << 20;
+    if (!mb && total_mb != 9809ULL)
+        hos_log("memory: game is told it has %llu MB (Switch 2 default is 9809). This fails an allocation "
+                "at the first submit. HOS_MEMORY_MB overrides. RX_VK_LOW_HEAP=0 keeps 9809.",
+                (unsigned long long)(hos_total_memory >> 20));
 #endif
 }
 
@@ -141,7 +153,12 @@ static void discard_pages(uint64_t addr, uint64_t size) {
     if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
         VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
 #elif !defined(__EMSCRIPTEN__)
-    madvise(GP(lo), (size_t)(hi - lo), MADV_DONTNEED);
+    extern int hos_posix_guest_discard(void *p, size_t n);   /* (hos_main.c: MADV_REMOVE on the memfd window) */
+    extern int rx_guest_imported(uint64_t lo, uint64_t hi);
+    /* (pages a dma-buf import holds stay where they are, zeroed: a hole punched under one would leave the GPU on
+       the old pages and the game on new ones) */
+    if (rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
+    else hos_posix_guest_discard(GP(lo), (size_t)(hi - lo));
 #endif
 }
 
@@ -286,7 +303,10 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
 #if defined(_WIN32)
         else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
 #else
-        else if (hi > lo) madvise(GP(lo), (size_t)(hi - lo), MADV_DONTNEED);   /* (linux: kept mapped, the pages read as zero) */
+        else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
+            extern int hos_posix_guest_discard(void *p, size_t n);
+            hos_posix_guest_discard(GP(lo), (size_t)(hi - lo));
+        }
 #endif
         RET(0);
         return;

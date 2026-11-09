@@ -18,6 +18,9 @@
 #include "vk_state.h"
 
 namespace mkwvk {
+// (hookshot) the seed's compute programs (vk_shader.cpp seed_program) have no bound program to read their layout from. Translated
+// with Maxwell's table instead, one kept the right key and the wrong storage buffers, and play would have used it as it was
+thread_local const uint8_t* seed_cs_control = nullptr;
 namespace {
 
 struct TexReg {
@@ -34,6 +37,7 @@ std::vector<TexReg> tex_regs;
 std::vector<SampReg> samp_regs;
 std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
+std::atomic<uint64_t> samp_gen{1};  // (bumped when a sampler registration's contents change: sampler_for's cache, vk_draw.cpp)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
@@ -51,7 +55,14 @@ struct CsLayout {
     uint32_t img_at() const { return tex_at() + 8 * tex; }
     uint32_t end() const { return img_at() + 8 * img; }
 };
+CsLayout cs_layout_of(const uint8_t* c) {   // (c: the control section from +0x58)
+    CsLayout l;
+    l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
+    l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+    return l;
+}
 CsLayout cs_layout(const NvnState& s) {
+    if (seed_cs_control) return cs_layout_of(seed_cs_control + 0x58);
     static std::mutex mu;
     static std::unordered_map<uint64_t, CsLayout> by_serial;
     std::lock_guard lk(mu);
@@ -65,8 +76,7 @@ CsLayout cs_layout(const NvnState& s) {
         host->gpu_read(s.prog.sd[i].control, &magic, 4);
         host->gpu_read(s.prog.sd[i].control + 0x56, &st, 2);
         if (magic != 0x98761234 || st != 5) continue;
-        l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
-        l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+        l = cs_layout_of(c);
         static const bool log_cs = getenv("RX_VK_LOG_CS") != nullptr;   // (hookshot) the control bytes 0xb0..0xbf
         if (log_cs) {
             char hex[700];
@@ -93,6 +103,18 @@ uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout
     if (count) *count = l.ssbo;
     if (layout_end) *layout_end = l.end();
     return l.ssbo_at();
+}
+
+/// (hookshot, #940) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
+/// the address word of an entry of the uniform or storage buffer table its control section lays out. Nothing is bound before the
+/// game, so the storage buffer pass's port (EDEN_NX2_GM_LEGACY=0), which binds an access to a pointer only when that pointer is
+/// mapped (Env::IsCbufStorageBufferPointer), found none and left every access to the run-time search, under the key play then used
+/// the program by. Answered from the layout, the prepared program comes out as play translates it
+bool seed_cs_buffer_word(uint32_t offset) {
+    if (!seed_cs_control || (offset & 15)) return false;
+    const CsLayout l = cs_layout_of(seed_cs_control + 0x58);
+    const auto in = [offset](uint32_t at, uint32_t n) { return offset >= at && offset < at + 16 * std::min(n, 16u); };
+    return in(l.ubo_at(), l.ubo) || in(l.ssbo_at(), l.ssbo);
 }
 
 const void* descriptor_ok(const void* p, size_t n) {
@@ -170,8 +192,14 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     const nvn_samp_par* p = &par;
     std::lock_guard lk(reg_mu);
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
+    // (sampler_for's cache goes stale only when a registration's contents change, not at each rewrite of the same)
+    const bool same = samp_regs[id].ok && !std::memcmp(&samp_regs[id].p, p, sizeof *p);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    if (!same) samp_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+uint64_t sampler_registrations_generation() {
+    return samp_gen.load(std::memory_order_acquire);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);

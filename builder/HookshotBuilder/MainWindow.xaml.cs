@@ -32,9 +32,16 @@ public partial class MainWindow : Window
     string? current;
     string finished = "";
     string? chosenNup, romfs, exefs;
+    // (issue 650) "Using the folders ..." above the list of .nup files, while romfs and exefs are the game files: FillDumps clears the
+    // list, so the note is made there again each time (it was gone as soon as the list was first filled)
+    string? foldersNote;
+    TextBlock? foldersNoteBlock;
     bool updating, checking;
     double compiled;
     int filesDone, filesOf;
+    int filesChanged = -1, filesCompiled;
+    double compileEta = -1;
+    long thisCompile, previousTotal = -1;
     string lastFailure = "";
 
     public MainWindow()
@@ -252,6 +259,7 @@ public partial class MainWindow : Window
         public string? Nup { get; set; }
         public string? Romfs { get; set; }
         public string? Exefs { get; set; }
+        public bool Dlss { get; set; }   // (NVIDIA DLSS ticked: NVIDIA's license was accepted)
     }
     static string SettingsPath => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "builder-settings.json");
@@ -262,12 +270,12 @@ public partial class MainWindow : Window
         try { s = System.Text.Json.JsonSerializer.Deserialize<BuilderSettings>(File.ReadAllText(SettingsPath)); } catch (Exception) { }
         if (s == null) return;
         if (!string.IsNullOrEmpty(s.Out)) OutPath.Text = s.Out;
+        DlssTick.IsChecked = s.Dlss;
         if (s.Romfs != null && s.Exefs != null && Directory.Exists(s.Romfs) && File.Exists(System.IO.Path.Combine(s.Exefs, "main")))
         {
             romfs = s.Romfs;
             exefs = s.Exefs;
-            DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {romfs} and {exefs} (as last time)", Style = (Style)FindResource("Note"),
-                                                        Margin = new Thickness(16, 12, 16, 12) });
+            foldersNote = $"Using the folders {romfs} and {exefs} (as last time)";
         }
         else if (s.Nup != null && File.Exists(s.Nup))
         {
@@ -284,7 +292,8 @@ public partial class MainWindow : Window
     {
         try
         {
-            var s = new BuilderSettings { Out = OutPath.Text, Nup = romfs == null ? chosenNup : null, Romfs = romfs, Exefs = exefs };
+            var s = new BuilderSettings { Out = OutPath.Text, Nup = romfs == null ? chosenNup : null, Romfs = romfs, Exefs = exefs,
+                                          Dlss = DlssTick.IsChecked == true };
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s));
         }
@@ -410,6 +419,12 @@ public partial class MainWindow : Window
     void FillDumps()
     {
         DumpList.Children.Clear();
+        foldersNoteBlock = null;
+        if (romfs != null && exefs != null && foldersNote != null)
+        {
+            foldersNoteBlock = new TextBlock { Text = foldersNote, Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) };
+            DumpList.Children.Add(foldersNoteBlock);
+        }
         if (dumps.Count == 0)
         {
             DumpList.Children.Add(new TextBlock
@@ -473,11 +488,12 @@ public partial class MainWindow : Window
                 ShowProblem(r.Text, tools: true);
                 return;
             }
-            if (chosenNup == null && r.Ok) chosenNup = d.Path;
+            // (issue 650: not over the romfs and exefs folders the player chose, here or last time: the found .nup showed as chosen)
+            if (chosenNup == null && romfs == null && r.Ok) chosenNup = d.Path;
             FillDumps();
             Refresh();
         }
-        if (chosenNup == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
+        if (chosenNup == null && romfs == null && dumps.Count > 0 && tools != null) { chosenNup = dumps[0].Path; FillDumps(); }
         checking = false;
         Refresh();
     }
@@ -487,6 +503,8 @@ public partial class MainWindow : Window
         sourcePicked = true;
         chosenNup = path;
         romfs = exefs = null;
+        if (foldersNoteBlock != null) DumpList.Children.Remove(foldersNoteBlock);   // (not the whole list again: this row's own event)
+        foldersNoteBlock = null;
         Refresh();
     }
 
@@ -512,6 +530,7 @@ public partial class MainWindow : Window
     {
         if (BuildButton == null) return;
         BuildButton.IsEnabled = SourceReady && OutPath.Text.Length > 2;
+        ShowWork();
         try
         {
             var root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(OutPath.Text))!;
@@ -570,8 +589,8 @@ public partial class MainWindow : Window
         romfs = r;
         exefs = x;
         chosenNup = null;
-        foreach (var rb in DumpList.Children.OfType<RadioButton>()) rb.IsChecked = false;
-        DumpList.Children.Insert(0, new TextBlock { Text = $"Using the folders {r} and {x}", Style = (Style)FindResource("Note"), Margin = new Thickness(16, 12, 16, 12) });
+        foldersNote = $"Using the folders {r} and {x}";
+        FillDumps();
         Refresh();
     }
 
@@ -582,6 +601,47 @@ public partial class MainWindow : Window
     }
 
     void BrowseOut(object sender, RoutedEventArgs e) => OutPath.Text = PickFolder("Choose where the game goes") ?? OutPath.Text;
+
+    void BrowseWork(object sender, RoutedEventArgs e)
+    {
+        if (PickFolder("Choose where Hookshot keeps its build files") is not { } picked) return;
+        ChangeWork(picked);
+    }
+
+    void ResetWork(object sender, RoutedEventArgs e) => ChangeWork(null);
+
+    void ChangeWork(string? picked)
+    {
+        try { Storage.MoveWork(picked); }
+        catch (Exception x) when (x is IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show(this, $"Hookshot cannot keep its build files there: {x.Message}", "Hookshot");
+        }
+        Refresh();
+    }
+
+    /// How much the build files take and where, said before the build (they stay after it, for quick updates)
+    void ShowWork()
+    {
+        if (WorkNote == null) return;
+        var work = Storage.Work;
+        WorkReset.Visibility = Storage.WorkChosen ? Visibility.Visible : Visibility.Collapsed;
+        WorkNote.Text = Storage.KeepBuildFiles
+            ? $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick (HOOKSHOT_KEEP_BUILD_FILES)."
+            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds, deleted when the game is ready.";
+        WorkNote.Foreground = (Brush)FindResource("InkSoft");
+        try
+        {
+            var root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(work))!;
+            var free = new DriveInfo(root).AvailableFreeSpace;
+            if (free < Storage.BuildFilesBytes)
+            {
+                WorkNote.Text += $" {root.TrimEnd('\\')} has only {Storage.Gb(free)} free.";
+                WorkNote.Foreground = (Brush)FindResource("Bad");
+            }
+        }
+        catch (Exception) { }
+    }
 
     void LanguageChanged(object sender, SelectionChangedEventArgs e)
     {
@@ -632,7 +692,24 @@ public partial class MainWindow : Window
         else if (chosenNup != null) args.AddRange(new[] { "--nup", chosenNup });
         else return;
         args.AddRange(new[] { "--out", OutPath.Text, "--language", lang.Code });
-        Run(tools, args);
+        Run(tools, args, dlss: DlssTick.IsChecked == true);
+    }
+
+    const string DlssLicense =
+        "NVIDIA DLSS is NVIDIA's, not Hookshot's. With it ticked, the build downloads NVIDIA's DLSS SDK (release v310.9.16) from " +
+        "github.com/NVIDIA/DLSS, under NVIDIA's own license, the NVIDIA RTX SDKs license:\n\n" +
+        "https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt\n\n" +
+        "Its files stay on this PC (in the builder's ngx-sdk folder, and nvngx_dlss.dll in the game folder's ngx folder). " +
+        "Hookshot never includes or shares them: never share a game folder built with them.\n\n" +
+        "Do you accept NVIDIA's license?";
+
+    /// The NVIDIA DLSS tick: NVIDIA's license first, and the tick stays only when it is accepted
+    void DlssChanged(object sender, RoutedEventArgs e)
+    {
+        if (DlssTick.IsChecked == true &&
+            MessageBox.Show(this, DlssLicense, "NVIDIA DLSS", MessageBoxButton.YesNo, MessageBoxImage.Information) != MessageBoxResult.Yes)
+            DlssTick.IsChecked = false;
+        SaveSettings();   // (kept at once, not only when Build is pressed: ticked and closed, it is still ticked next time)
     }
 
     static readonly (string Id, string Build, string Update)[] Stages =
@@ -662,7 +739,8 @@ public partial class MainWindow : Window
         if (update) rows["read"].Small("Your game files are kept: the .nup isn't needed");
     }
 
-    void Run(Tools tools, List<string> args, bool keepRows = false)
+    /// dlss: NVIDIA DLSS, its license accepted: NVIDIA's SDK fetched into Storage.NgxSdk first (only what is missing), and built in
+    void Run(Tools tools, List<string> args, bool keepRows = false, bool dlss = false)
     {
         int? workers;
         try { workers = BuildWorkers.Selected(WorkerBox.SelectedItem); }
@@ -686,6 +764,11 @@ public partial class MainWindow : Window
         finished = "";
         compiled = 0;
         filesDone = filesOf = 0;
+        filesChanged = -1;
+        filesCompiled = 0;
+        compileEta = -1;
+        thisCompile = 0;
+        previousTotal = -1;
         ShowPage(BuildPage);
         CancelButton.Visibility = Visibility.Visible;
         SetProgress(updating ? Weight["read"].From : 0);
@@ -693,7 +776,9 @@ public partial class MainWindow : Window
         compileClock.Reset();
         clock.Start();
         Tick();
-        runner = new Runner(tools, args, workers);
+        if (Storage.WorkChosen && !args.Contains("--work")) args.AddRange(new[] { "--work", Storage.Work });   // (the build files where the player chose)
+        if (dlss && !args.Contains("--fetch-ngx-sdk")) args.AddRange(new[] { "--fetch-ngx-sdk", "--accept-nvidia-license" });
+        runner = new Runner(tools, args, workers, dlss ? Storage.NgxSdk : null);
         runner.Line += l => Dispatcher.BeginInvoke(() => Line(l));
         runner.Finished += failure => Dispatcher.BeginInvoke(() => Ended(failure));
         runner.Start();
@@ -722,11 +807,54 @@ public partial class MainWindow : Window
             }
             return;
         }
+        else if (line.StartsWith("@@plan ") || line.StartsWith("@@file ") || line.StartsWith("@@eta ") || line.StartsWith("@@times "))
+        {
+            Number(line);
+            return;
+        }
         else if (line.StartsWith("@@done ")) finished = line[7..];
         else if (FilesLine.Match(line) is { Success: true } m) filesOf = int.Parse(m.Groups[1].Value);
         else if (FileLine.IsMatch(line)) filesDone++;
-        if (current == "compile" && filesOf > 0 && rows.TryGetValue("compile", out var c)) c.Small($"{filesDone} of {filesOf} files");
+        if (current == "compile" && filesChanged < 0 && filesOf > 0 && rows.TryGetValue("compile", out var c))
+            c.Small($"{filesDone} of {filesOf} files");
         AddLog(line);
+    }
+
+    /// The compile timer's lines: build.py says which files this run really rebuilds and how long each took before (the
+    /// countdown), and make_game.py gives this build's times beside the last one's. Not shown in details: the compiler's
+    /// own lines there already carry each file's seconds.
+    void Number(string line)
+    {
+        var p = line.Split(' ');
+        switch (p[0])
+        {
+            case "@@plan" when p.Length == 3 && int.TryParse(p[1], out var changed) && int.TryParse(p[2], out var total):
+                filesChanged = changed;
+                filesOf = total;
+                filesCompiled = 0;
+                ChangedFiles();
+                break;
+            case "@@file" when p.Length == 4 && (p[3] is "new" or "again"):
+                filesCompiled++;
+                ChangedFiles();
+                break;
+            case "@@eta" when p.Length == 2 && double.TryParse(p[1], System.Globalization.NumberStyles.Float,
+                                                              System.Globalization.CultureInfo.InvariantCulture, out var eta):
+                compileEta = eta;
+                break;
+            case "@@times" when p.Length == 4:
+                long.TryParse(p[2], out thisCompile);
+                long.TryParse(p[3], out previousTotal);
+                break;
+        }
+    }
+
+    void ChangedFiles()
+    {
+        if (filesChanged < 0 || !rows.TryGetValue("compile", out var row)) return;
+        row.Small(filesChanged == 0 ? "Everything is already built"
+                : filesChanged >= filesOf ? $"{filesCompiled} of {filesChanged} files"
+                : $"{filesCompiled} of {filesChanged} changed files");
     }
 
     void AddLog(string line)
@@ -758,15 +886,27 @@ public partial class MainWindow : Window
     {
         foreach (var r in rows.Values) r.Tick();
         if (runner == null) return;
-        string left;
-        if (current == "compile" && compiled > 0.03)
+        var tail = updating ? ". Your current game stays as it is until the new one is complete." : " · your PC stays usable";
+        if (current == "compile")
         {
-            var rest = compileClock.Elapsed.TotalSeconds / compiled * (1 - compiled) + 60;
-            left = rest > 90 ? $"About {(int)Math.Round(rest / 60)} minutes left" : "About a minute left";
+            // (the timer of the compile itself, and the countdown build.py works out from what this PC measured before)
+            var left = compileEta >= 0 ? TimeLeft(compileEta)
+                : compiled > 0.03 ? TimeLeft(compileClock.Elapsed.TotalSeconds / compiled * (1 - compiled) + 60)
+                : "Estimating…";
+            BuildNote.Text = $"Compiling {Clock(compileClock.Elapsed)} · {left}{tail}";
+            return;
         }
-        else left = updating ? "Working…" : "Usually about 45 minutes";
-        BuildNote.Text = updating ? $"{left}{(left.EndsWith("…") ? "" : ".")} Your current game stays as it is until the new one is complete."
-                                  : $"{left} · your PC stays usable";
+        BuildNote.Text = (updating ? "Working…" : "Usually about 45 minutes") + tail;
+    }
+
+    static string Clock(TimeSpan t) => $"{(int)t.TotalMinutes}:{t.Seconds:00}";
+
+    static string TimeLeft(double seconds)
+    {
+        if (seconds < 45) return "Less than a minute left";
+        if (seconds < 90) return "About a minute left";
+        var minutes = (int)Math.Round(seconds / 60);
+        return minutes >= 60 ? $"About {minutes / 60} h {minutes % 60} min left" : $"About {minutes} minutes left";
     }
 
     void Ended(string? failure)
@@ -816,7 +956,8 @@ public partial class MainWindow : Window
     {
         SetStep(2);
         ReadyTitle.Text = updating ? "Your game is updated" : "Your game is ready";
-        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)} · {finished}";
+        var compiledNote = thisCompile > 0 ? $" (compiled in {Span(TimeSpan.FromSeconds(thisCompile))})" : "";
+        ReadyNote.Text = $"{(updating ? "Updated" : "Built")} in {Span(elapsed.Elapsed)}{compiledNote}{Against(elapsed.Elapsed)} · {finished}";
         if (!updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
             Finder.Shortcuts(finished, DesktopTick.IsChecked == true, StartTick.IsChecked == true);
         else if (updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
@@ -827,7 +968,52 @@ public partial class MainWindow : Window
         }
         if (Finder.ShortcutError != null) AddLog("shortcut not made: " + Finder.ShortcutError);
         ShowPage(ReadyPage);
+        _ = FreeAfterBuild();
     }
+
+    // (issue: 5 GB and more left in %LOCALAPPDATA% and never said. Said here, with the way to let it go)
+    async Task ShowStorageUse()
+    {
+        StorageRow.Visibility = Visibility.Collapsed;
+        var (total, freeable) = await Task.Run(Storage.Measure);
+        if (total < 100L << 20) return;
+        // (both places when the build files are in a folder the player chose: the total counts both)
+        var where = Storage.WorkChosen ? $"{Storage.Base} and {Storage.Work}" : Storage.Base;
+        StorageNote.Text = freeable >= 100L << 20
+            ? $"Hookshot Builder keeps {Storage.Gb(total)} on this PC ({where}). {Storage.Gb(freeable)} of it only makes the next " +
+              "update quicker and can be freed: your game keeps playing, and the next update then takes about as long as this build."
+            : $"Hookshot Builder keeps {Storage.Gb(total)} on this PC ({where}): the builder itself.";
+        FreeButton.Visibility = freeable >= 100L << 20 ? Visibility.Visible : Visibility.Collapsed;
+        FreeButton.IsEnabled = true;
+        FreeButton.Content = "Free up space";
+        StorageRow.Visibility = Visibility.Visible;
+    }
+
+    // (players asked for the space back: the build files (translated code, compiled objects), the setup's and updater's downloads and
+    // older builder versions go as soon as the game is ready. The next update then translates and compiles again (about as long as
+    // this build). HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, with the Free up space button as before)
+    async Task FreeAfterBuild()
+    {
+        if (!Storage.KeepBuildFiles)
+        {
+            var left = await Task.Run(Storage.Free);
+            if (left >= 100L << 20) AddLog($"build files: {Storage.Gb(left)} could not be deleted (a file in use); they go after the next build");
+        }
+        await ShowStorageUse();
+    }
+
+    async void FreeSpace(object sender, RoutedEventArgs e)
+    {
+        FreeButton.IsEnabled = false;
+        FreeButton.Content = "Freeing…";
+        var left = await Task.Run(Storage.Free);
+        await ShowStorageUse();
+        if (left >= 100L << 20)
+            StorageNote.Text += $" ({Storage.Gb(left)} could not be deleted: a file is in use. Close the game and the builder, and delete the folder's contents by hand.)";
+    }
+
+    void ShowStorage(object sender, RoutedEventArgs e) =>
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{(Storage.WorkChosen ? Storage.Work : Storage.Base)}\"") { UseShellExecute = true });   // (the bigger one)
 
     void ShortcutsChanged(object sender, RoutedEventArgs e)
     {
@@ -835,6 +1021,18 @@ public partial class MainWindow : Window
     }
 
     static string Span(TimeSpan t) => t.TotalHours >= 1 ? $"{(int)t.TotalHours} h {t.Minutes} min" : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes} minutes" : $"{t.Seconds} seconds";
+
+    /// This build beside the last one on this PC (build_times.json, through make_game.py's @@times): "last time 45 minutes
+    /// (4 minutes faster)"
+    string Against(TimeSpan now)
+    {
+        if (previousTotal <= 0) return "";
+        var last = TimeSpan.FromSeconds(previousTotal);
+        var diff = last.TotalSeconds - now.TotalSeconds;
+        var how = Math.Abs(diff) < 30 ? "about the same"
+                : diff > 0 ? $"{Span(TimeSpan.FromSeconds(diff))} faster" : $"{Span(TimeSpan.FromSeconds(-diff))} slower";
+        return $" · last time {Span(last)} ({how})";
+    }
 
     void OpenFolder(object sender, RoutedEventArgs e) =>
         Process.Start(new ProcessStartInfo("explorer.exe", $"\"{finished}\"") { UseShellExecute = true });
@@ -972,7 +1170,10 @@ public partial class MainWindow : Window
     {
         download = null;
         if (rows.TryGetValue("download", out var d)) { d.Done(); d.Small("Build tools checked"); }
-        Run(tools, new List<string> { "--update", folder }, keepRows: true);
+        // (a folder built with NVIDIA DLSS, its license accepted then, is built with it again)
+        var dlss = File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
+                   File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt"));
+        Run(tools, new List<string> { "--update", folder }, keepRows: true, dlss: dlss);
     }
 
     // ================= the window =================

@@ -139,15 +139,18 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 1, dli.pBindings = &b;
     VkDescriptorSetLayout dsl{};
-    vkCreateDescriptorSetLayout(dev.device, &dli, nullptr, &dsl);
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1, pli.pSetLayouts = &dsl;
     VkPipelineLayout layout{};
-    vkCreatePipelineLayout(dev.device, &pli, nullptr, &layout);
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size() * 4, smi.pCode = code.data();
     VkShaderModule module{};
-    vkCreateShaderModule(dev.device, &smi, nullptr, &module);
+    {
+        PipelineCreateLock lock;
+        vkCreateDescriptorSetLayout(dev.device, &dli, nullptr, &dsl);
+        vkCreatePipelineLayout(dev.device, &pli, nullptr, &layout);
+        vkCreateShaderModule(dev.device, &smi, nullptr, &module);
+    }
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
@@ -155,8 +158,8 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
     if (dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT) cpi.stage.pNext = &lanes;
     cpi.layout = layout;
     VkPipeline pipeline{};
-    const VkResult pr = module ? vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline)
-                               : VK_ERROR_INITIALIZATION_FAILED;
+    VkResult pr = VK_ERROR_INITIALIZATION_FAILED;
+    if (module) { PipelineCreateLock lock; pr = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline); }
     bool ok = false;
     if (pr == VK_SUCCESS) {
         VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
@@ -207,13 +210,19 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data) 
         vkDestroyFence(dev.device, fence, nullptr);
         vkDestroyCommandPool(dev.device, cmd_pool, nullptr);
         vkDestroyDescriptorPool(dev.device, pool, nullptr);
-        vkDestroyPipeline(dev.device, pipeline, nullptr);
+        {
+            PipelineCreateLock lock;
+            vkDestroyPipeline(dev.device, pipeline, nullptr);
+        }
     } else {
         logf("vk: cooperative matrix test: pipeline creation failed (%d)", (int)pr);
     }
-    if (module) vkDestroyShaderModule(dev.device, module, nullptr);
-    vkDestroyPipelineLayout(dev.device, layout, nullptr);
-    vkDestroyDescriptorSetLayout(dev.device, dsl, nullptr);
+    {
+        PipelineCreateLock lock;
+        if (module) vkDestroyShaderModule(dev.device, module, nullptr);
+        vkDestroyPipelineLayout(dev.device, layout, nullptr);
+        vkDestroyDescriptorSetLayout(dev.device, dsl, nullptr);
+    }
     vkDestroyBuffer(dev.device, buffer, nullptr);
     vkFreeMemory(dev.device, memory, nullptr);
     return ok;
@@ -343,6 +352,12 @@ void software_multiplies(const char* why) {
 } // namespace
 
 void coopmat_init() {
+    // (amd-fix) NaN guard on float colour outputs (mma_layout.h frag_nan_guard), on every card since v2.0.6 as NX2navi's patch 0027
+    // has it: the neon plants were reported on NVIDIA cards too, and one NaN texel spreads through bloom and blur
+    Shader::Backend::SPIRV::frag_nan_guard = !std::getenv("RX_VK_NO_NAN_GUARD");
+    if (Shader::Backend::SPIRV::frag_nan_guard) logf("vk: colour outputs NaN-guarded");
+    Shader::Backend::SPIRV::position_invariant = dev.props.vendorID != 0x10DE && !std::getenv("RX_VK_NO_INVARIANT");
+    if (Shader::Backend::SPIRV::position_invariant) logf("vk: positions invariant (not an NVIDIA card)");
     // (hookshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
     // (emit_spirv_warp.cpp, from Lichii): the lowering still gives HMMA_nx2 (dev.native_mma)
     if (const char* sw = std::getenv("RX_VK_MMA_SOFTWARE"); sw && std::atoi(sw)) {

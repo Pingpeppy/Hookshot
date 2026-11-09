@@ -66,6 +66,13 @@ int vkCreateSampler(int, const VkSamplerCreateInfo* s, void*, VkSampler* out) {
     CHECK(s->magFilter == VK_FILTER_LINEAR && s->minFilter == VK_FILTER_LINEAR);
     ++sampler_calls; *out = sampler_fail ? 0 : 4; return sampler_fail ? -1 : VK_SUCCESS;
 }
+struct PipelineCreateLock {
+    int held = 0;
+    PipelineCreateLock() { held = 1; }
+    ~PipelineCreateLock() { held = 0; }
+    PipelineCreateLock(const PipelineCreateLock&) = delete;
+    PipelineCreateLock& operator=(const PipelineCreateLock&) = delete;
+};
 void vkDestroyPipeline(int, uint64_t, void*) { ++destroyed_pipes; }
 void vkDestroyPipelineLayout(int, uint64_t, void*) { ++destroyed_layouts; }
 void vkDestroyDescriptorSetLayout(int, uint64_t, void*) { ++destroyed_sets; }
@@ -75,6 +82,8 @@ void vkDeviceWaitIdle(int) {
     CHECK(flushes > waits); // upstream batching must be drained before waiting for idle
     ++waits;
 }
+// vk_replay.cpp's helper (it also takes the present queue's own lock, which this fixture has no queue for): drain, then idle
+void device_wait_idle_locked() { queue_flush_locked(); vkDeviceWaitIdle(dev.device); }
 void drop_img(Img& i) { i = {}; }
 bool make_img(Img& i, uint32_t w, uint32_t h, int format, int usage) {
     CHECK(w && h && format == VK_FORMAT_R8G8B8A8_UNORM);

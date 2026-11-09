@@ -4,17 +4,34 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "vk_api.h"
 #include "vk_draw.h"
+#include "vk_framegen.h"
 #include "vk_internal.h"
+#include "gpu_choice.h"
+#include "vk_jobs.h"
+#include "vk_menu.h"
+#include "vk_dlss.h"
+#include "vk_reflex.h"
+#include "vk_progress.h"
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -54,10 +71,7 @@ void load_device(VkDevice device) {
 
 namespace mkwvk {
 
-
-
-
-
+std::vector<std::string> gpu_device_names;
 const MkwVkHost* host;
 int64_t prof_ns[PROF_COUNT];
 Device dev;
@@ -108,8 +122,16 @@ bool create_instance() {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
-    ci.enabledExtensionCount = n_exts;
-    ci.ppEnabledExtensionNames = exts;
+    std::vector<const char*> ext_list(exts, exts + n_exts);
+    {   // (hookshot) what NVIDIA DLSS needs (vk_dlss.cpp; nothing in a build without it)
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> all(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
+        dlss_instance_extensions(ext_list, all);
+    }
+    ci.enabledExtensionCount = (uint32_t)ext_list.size();
+    ci.ppEnabledExtensionNames = ext_list.data();
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
@@ -122,33 +144,63 @@ bool create_instance() {
 }
 
 bool pick_device() {
+    menu_init();
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(dev.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> all(n);
     vkEnumeratePhysicalDevices(dev.instance, &n, all.data());
-    // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
-    // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
-    // processor graphics' driver, which the card's own update leaves as it was: on an RX 7700S that older driver
-    // (amdvlk64.dll 32.0.11036.4002) crashed in its shader compiler (0xc0000409) on the game's compute pipelines while
-    // the card's 32.0.32015.7029 built them. The same kind of GPU twice: the one with the newer driver wins.
-    // RX_VK_DEVICE=<n>: that device, as listed in the log
-    int best = -1, best_score = -1;
-    uint32_t best_driver = 0;
-    const char* want = getenv("RX_VK_DEVICE");
+
+    std::vector<uint32_t> valid_gpus;
+    gpu_device_names.clear();
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(all[i], &p);
         logf("vk: device %u: %s, Vulkan %u.%u, driver %#x, type %d", i, p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
              VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion, (int)p.deviceType);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
-        if (want && *want) {
-            if ((uint32_t)atoi(want) == i) best = (int)i, best_score = 3;
+        if (p.apiVersion >= VK_API_VERSION_1_3) {
+            valid_gpus.push_back(i);
+            gpu_device_names.push_back(p.deviceName);
+        }
+    }
+    menu_set_gpu_count((int)valid_gpus.size());
+
+    // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
+    // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
+    // processor graphics' driver, which the card's own update leaves as it was: on an RX 7700S that older driver
+    // (amdvlk64.dll 32.0.11036.4002) crashed in its shader compiler (0xc0000409) on the game's compute pipelines while
+    // the card's 32.0.32015.7029 built them. The same kind of GPU twice: the one with the newer driver wins.
+    // RX_VK_DEVICE=<n> or opts.gpu_device: that device, as listed in the log
+    int best = -1, best_score = -1;
+    uint32_t best_driver = 0;
+    int target_raw_idx = -1;
+    if (const char* want = getenv("RX_VK_DEVICE")) {
+        if (*want) target_raw_idx = atoi(want);
+    } else if (const int k = gpu_choice::menu_device(opts.gpu_device, (int)valid_gpus.size()); k >= 0) {
+        target_raw_idx = (int)valid_gpus[k];
+    }
+
+    for (uint32_t i : valid_gpus) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(all[i], &p);
+        if (target_raw_idx >= 0) {
+            if ((int)i == target_raw_idx) best = (int)i, best_score = 3;
             continue;
         }
         const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
                           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
         if (score > best_score || (score == best_score && p.driverVersion > best_driver))
             best = (int)i, best_score = score, best_driver = p.driverVersion;
+    }
+    if (best < 0 && target_raw_idx >= 0) {
+        logf("vk: preferred device %d not available or lacks Vulkan 1.3, falling back to auto selection", target_raw_idx);
+        for (uint32_t i : valid_gpus) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(all[i], &p);
+            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
+                              p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+            if (score > best_score || (score == best_score && p.driverVersion > best_driver))
+                best = (int)i, best_score = score, best_driver = p.driverVersion;
+        }
     }
     if (best < 0) {
         logf("vk: no Vulkan 1.3 GPU");
@@ -170,8 +222,13 @@ bool create_device() {
         flag = has_extension(exts, name);
         if (flag) want.push_back(name);
     };
-    optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
+    // (RX_VK_FORCE_MESH_FALLBACK=1, a test: mesh shaders not used where they are, so the no-mesh fallback the GTX 10xx and RX 5000
+    // cards run (issue 640) can be tried on any GPU)
+    if (getenv("RX_VK_FORCE_MESH_FALLBACK") && atoi(getenv("RX_VK_FORCE_MESH_FALLBACK")) != 0) dev.mesh_shader = false;
+    else optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
     optional(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, dev.external_memory_host);
+    optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, dev.external_memory_fd);   // (guest memory as udmabufs: vk_memory.cpp import_dma_buf)
+    if (dev.external_memory_fd) optional(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, dev.dma_buf_import);
     optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, dev.pipeline_library);
     if (dev.pipeline_library) optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, dev.graphics_pipeline_library);
     optional(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, dev.custom_border_color);
@@ -192,8 +249,13 @@ bool create_device() {
     // RX_VK_CHECKPOINTS=0: off
     if (!getenv("RX_VK_CHECKPOINTS") || strcmp(getenv("RX_VK_CHECKPOINTS"), "0") != 0)
         optional(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, dev.checkpoints);
+    // (asked for only: a marker written twice a draw, where the NV ones are not there to hide a race)
+    if (const char* c = getenv("RX_VK_CHECKPOINTS"); !dev.checkpoints && c && strcmp(c, "0") != 0 && strcmp(c, "ext") != 0)
+        optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
+    reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -210,6 +272,35 @@ bool create_device() {
     q.queueFamilyIndex = dev.queue_family;
     q.queueCount = 1;
     q.pQueuePriorities = &priority;
+    // (hookshot) The presents on a queue of a compute family of their own, beside the replay's (RX_VK_PRESENT_QUEUE=1 / 0: on /
+    // off; on by default with NVIDIA's driver on Windows, where it was measured). On the replay's queue vkQueuePresentKHR blocked
+    // with dev.present_mu held, ~0.8 ms a present with frame interpolation at 4x and up to 8, and the game's main and presentation
+    // threads waited there to submit. A second queue of the graphics family took that lock off the presents, but its presents
+    // blocked longer (~2-4 ms: the graphics work of the two queues takes turns on the GPU) and the made frames were shown late
+    // four times as often. A compute family's queue runs beside the graphics work: in Hyrule Field (a 14700K and an RTX 5070 Ti,
+    // 4x, 175 Hz) the game went from ~52 to ~58 fps standing and ~46.5 to ~53 running, its frames over 22 ms from ~13% to ~1%
+    // standing and over 40 ms from ~4% to ~0.2% running, the made frames as evenly shown standing. The swapchain's images are
+    // shared by both families (vk_main.cpp create_swapchain), and a family that cannot present to the window leaves it off.
+    uint32_t compute_family = UINT32_MAX;
+    {
+        bool want = false;
+#ifdef _WIN32
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        want = false;   // (v2.0.9: off by default with the write-back diff until issue 1161's device lost is placed; was:
+        (void)dp;       //  NVIDIA's driver on Windows. RX_VK_PRESENT_QUEUE=1: on)
+#endif
+        if (const char* e = getenv("RX_VK_PRESENT_QUEUE")) want = atoi(e) != 0;
+        for (uint32_t i = 0; want && i < n && compute_family == UINT32_MAX; i++)
+            if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+                compute_family = i;
+    }
+    VkDeviceQueueCreateInfo qs[2] = {q, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    qs[1].queueFamilyIndex = compute_family;
+    qs[1].queueCount = 1;
+    qs[1].pQueuePriorities = &priority;
 
     // features: what the hardware has of what the replay uses (all of them on the GPUs MKW-class hardware maps to)
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -244,16 +335,35 @@ bool create_device() {
     if (dev.view_2d_of_3d) *tail = &v2d3d, tail = &v2d3d.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+    reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
-    // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default now: the GPU
+    // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default: the GPU
     // culling pass 53caac5f faulted the device while a save loaded, about one start in three, and the scene's lighting read garbage
     // for single frames (the black flashes); with it, neither in A/B runs at the same GPU time. Lichii's OoT branch keeps it on too.
-    // RX_VK_ROBUST=0: off, null descriptors only)
-    static const bool robust = !getenv("RX_VK_ROBUST") || atoi(getenv("RX_VK_ROBUST")) != 0;
+    // The 'Robust buffers' row of hookshot_options.ini chooses (0 Auto: on, on every vendor; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
+    // over it. Off is null descriptors only: some NVIDIA cards ran slower with it on, issues 394, 418, 419)
+    static const bool robust = []() -> bool {
+        if (const char* e = getenv("RX_VK_ROBUST")) return atoi(e) != 0;
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);   // (the game folder, not bin beside the launcher: vk_paths.h)
+        std::string ini(exe, n);
+        ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "hookshot_options.ini";
+        int v = 0;   // (Auto)
+        if (FILE* f = fopen(ini.c_str(), "r")) {
+            char line[80];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "robust_buffers=", 15)) {
+                    v = atoi(line + 15);
+                    break;
+                }
+            fclose(f);   // (once: the PR closed it twice when the row said Auto)
+        }
+        return v != 1;   // (Auto and On: on)
+    }();
     const bool robust_ok = robust && robust2.robustBufferAccess2 && f.features.robustBufferAccess;
     robust2.robustBufferAccess2 = robust_ok ? VK_TRUE : VK_FALSE;
     robust2.robustImageAccess2 = VK_FALSE;
@@ -298,15 +408,32 @@ bool create_device() {
     }
     mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;   // (not used)
     dev.mesh_shader = dev.mesh_shader && mesh.meshShader && mesh.taskShader;
+    // RX_VK_MESH_FALLBACK=1: the issue 640 compute path even when the device has mesh shaders (a backup when the
+    // driver's mesh compiler faults). Off unless that variable is set. GPUs without mesh shaders take the same path.
+    const bool force_mesh_fallback = [] {
+        const char* e = getenv("RX_VK_MESH_FALLBACK");
+        return e && e[0] && std::atoi(e) != 0;
+    }();
+    if (force_mesh_fallback) dev.mesh_shader = false;
+    dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
+    if (dev.mesh_fallback && force_mesh_fallback)
+        logf("vk: task and mesh programs run as compute shaders (RX_VK_MESH_FALLBACK=1; the device has mesh shaders)");
+    else if (dev.mesh_fallback)
+        logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
+    else if (force_mesh_fallback)
+        logf("vk: RX_VK_MESH_FALLBACK=1, but this GPU has no buffer device addresses, so mesh programs are left out");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
+    logf("vk: nullDescriptor %s", dev.null_descriptor ? "on" : "off");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
-    dev.sparse_images = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding &&
+    dev.sparse_binding = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
+    dev.sparse_images = dev.sparse_binding &&
                         f.features.sparseResidencyImage2D && !(getenv("RX_VK_SPARSE") && !atoi(getenv("RX_VK_SPARSE")));
+    dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
-    ci.queueCreateInfoCount = 1;
-    ci.pQueueCreateInfos = &q;
+    ci.queueCreateInfoCount = compute_family != UINT32_MAX ? 2 : 1;
+    ci.pQueueCreateInfos = qs;
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
     if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
@@ -317,7 +444,12 @@ bool create_device() {
 
     load_device(dev.device);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    dev.present_queue = VK_NULL_HANDLE;
+    dev.present_family = dev.queue_family;
+    if (compute_family != UINT32_MAX) vkGetDeviceQueue(dev.device, compute_family, 0, &dev.present_queue), dev.present_family = compute_family;
+    if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
+    reflex_device_created();
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -332,26 +464,64 @@ bool create_device() {
 
 bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
+    if (result != VK_SUCCESS) {
+        logf("vk: querying surface capabilities failed (VkResult %d)", (int)result);
+        return false;
+    }
     if (caps.currentExtent.width != UINT32_MAX) width = caps.currentExtent.width, height = caps.currentExtent.height;
+    logf("vk: surface caps images %u..%u extent %ux%u..%ux%u usage %#x alpha %#x transform %#x",
+         caps.minImageCount, caps.maxImageCount, caps.minImageExtent.width, caps.minImageExtent.height,
+         caps.maxImageExtent.width, caps.maxImageExtent.height, caps.supportedUsageFlags,
+         caps.supportedCompositeAlpha, caps.supportedTransforms);
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        logf("vk: surface does not support transfer-destination swapchain images");
+        return false;
+    }
     if (!width || !height) return false;
     uint32_t n = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, nullptr);
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, nullptr);
+    if (result != VK_SUCCESS || !n) {
+        logf("vk: querying surface formats failed (VkResult %d, count %u)", (int)result, n);
+        return false;
+    }
     std::vector<VkSurfaceFormatKHR> formats(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, formats.data());
     VkSurfaceFormatKHR fmt = formats[0];
     for (const auto& f : formats)   // (an UNORM target: the game's window textures are presented as they are)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) fmt = f;
-    // immediate when there is one (the game paces itself: nn_vi.c), else FIFO
-    vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
-    std::vector<VkPresentModeKHR> modes(n);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, modes.data());
+        // (in sRGB: RADV on Wayland lists every format again with PASS_THROUGH_EXT and the compositor's colour spaces,
+        // and the last UNORM entry left the compositor an untagged surface, a grey picture. Still the last sRGB one, so
+        // a driver that lists only sRGB (NVIDIA, X11, Windows) keeps the format it had.)
+        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            fmt = f;
+    // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
+    n = 0;
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes;
+    if (result == VK_SUCCESS && n) {
+        modes.resize(n);
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, modes.data());
+    }
+    if (result != VK_SUCCESS || modes.empty())
+        logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (auto m : modes)   // (RX_VK_FIFO=1: as on a card or driver with vsync forced, or no mailbox)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !getenv("RX_VK_FIFO")) mode = m;
-    // (hookshot) no mailbox (AMD's Windows driver has none): immediate before FIFO, which held anything under 60 fps to 30 (40 fps became 30 here)
-    for (auto m : modes)
-        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR && (getenv("RX_VK_IMMEDIATE") || mode == VK_PRESENT_MODE_FIFO_KHR) && !getenv("RX_VK_FIFO")) mode = m;
+    const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
+    if (!force_fifo) {
+        for (auto m : modes)
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
+        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
+        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
+        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
+        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+#ifdef _WIN32
+        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
+#else
+        if (want_immediate)
+#endif
+            for (auto m : modes)
+                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+    }
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
@@ -360,21 +530,56 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     ci.imageColorSpace = fmt.colorSpace;
     ci.imageExtent = {width, height};
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;   // (copied from, for RX_VK_DUMP)
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
+        for (VkCompositeAlphaFlagBitsKHR alpha : {VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                                  VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+                                                  VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR})
+            if (caps.supportedCompositeAlpha & alpha) { ci.compositeAlpha = alpha; break; }
+    }
     ci.presentMode = mode;
+    const uint32_t sharing[2] = {dev.queue_family, dev.present_family};
+    if (dev.present_queue && dev.present_family != dev.queue_family) {   // (presented from another family: no ownership moves)
+        ci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        ci.queueFamilyIndexCount = 2;
+        ci.pQueueFamilyIndices = sharing;
+    }
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = dev.swapchain;
+    reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
     VkSwapchainKHR sc;
-    if (vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc) != VK_SUCCESS) return false;
+    result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
+    if (result != VK_SUCCESS) {
+        logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
+             (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
+        return false;
+    }
+    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr) != VK_SUCCESS || !n) {
+        vkDestroySwapchainKHR(dev.device, sc, nullptr);
+        return false;
+    }
+    std::vector<VkSemaphore> rendered(n, VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (auto& semaphore : rendered) {
+        if (vkCreateSemaphore(dev.device, &si, nullptr, &semaphore) != VK_SUCCESS) {
+            for (auto made : rendered)
+                if (made) vkDestroySemaphore(dev.device, made, nullptr);
+            vkDestroySwapchainKHR(dev.device, sc, nullptr);
+            return false;
+        }
+    }
     if (dev.swapchain) {
-        queue_flush_locked();
-        vkDeviceWaitIdle(dev.device);
+        device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
+        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
         vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
     }
     dev.swapchain = sc;
+    dev.swap_rendered = std::move(rendered);
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
     vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
@@ -382,12 +587,487 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());
     logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
 }
 
 namespace {
 
 HWND main_window = nullptr;
+#ifndef _WIN32
+const MkwVkWindow* prep_window = nullptr;
+#endif
+// 5x7, bit 4 is the leftmost pixel. Lower case is drawn as upper case.
+const uint8_t* splash_glyph(char c) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    static const uint8_t font[59][7] = {
+        {}, {}, {}, {}, {},
+        {0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13}, // %
+        {}, {},
+        {0x04, 0x08, 0x10, 0x10, 0x10, 0x08, 0x04}, // (
+        {0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10}, // )
+        {}, {}, {}, {}, {},
+        {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}, // /
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // 0
+        {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+        {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+        {0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E},
+        {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
+        {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+        {0x0E, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x0E},
+        {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+        {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+        {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}, // 9
+        {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}, // :
+        {}, {}, {}, {}, {}, {},
+        {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, // A
+        {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+        {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+        {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+        {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+        {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+        {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E},
+        {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+        {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
+        {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C},
+        {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
+        {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+        {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+        {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+        {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+        {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
+        {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+        {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
+        {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+        {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+        {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
+        {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
+        {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
+        {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
+        {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}, // Z
+    };
+    if ((unsigned)c < 32 || (unsigned)c > 90) return font[0];
+    return font[c - 32];
+}
+
+struct Splash {
+    bool ready = false;
+    bool failed = false;
+    bool busy = false;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint8_t* map = nullptr;
+    uint32_t width = 0;
+    int last_pct = -2;
+    std::chrono::steady_clock::time_point last_draw{};
+    std::chrono::steady_clock::time_point phase_t0{};
+    size_t phase_total = 0;
+};
+Splash splash;
+
+// The progress bar asks for a turn. The driver thread, between creates, sets splash_yield and waits
+// briefly so the bar can present without submitting during a compile. splash_stop clears both.
+std::atomic<int> splash_want{0};
+std::atomic<int> splash_yield{0};
+
+void splash_free_buffer() {
+    if (splash.mem) {
+        auto unmap = (PFN_vkUnmapMemory)vkGetDeviceProcAddr(dev.device, "vkUnmapMemory");
+        if (unmap && splash.map) unmap(dev.device, splash.mem);
+        vkFreeMemory(dev.device, splash.mem, nullptr);
+    }
+    if (splash.buf) vkDestroyBuffer(dev.device, splash.buf, nullptr);
+    splash.buf = VK_NULL_HANDLE;
+    splash.mem = VK_NULL_HANDLE;
+    splash.map = nullptr;
+    splash.width = 0;
+}
+
+void splash_stop() {
+    // A short wait destroyed the fence while the first present was still in it (gamescope, a slow queue).
+    if (splash.busy && splash.fence)
+        vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, UINT64_MAX);
+    splash.busy = false;
+    splash_free_buffer();
+    if (splash.acquired) vkDestroySemaphore(dev.device, splash.acquired, nullptr);
+    if (splash.fence) vkDestroyFence(dev.device, splash.fence, nullptr);
+    if (splash.pool) vkDestroyCommandPool(dev.device, splash.pool, nullptr);
+    splash.acquired = VK_NULL_HANDLE;
+    splash.fence = VK_NULL_HANDLE;
+    splash.pool = VK_NULL_HANDLE;
+    splash.cmd = VK_NULL_HANDLE;
+    splash.ready = false;
+    // The driver thread yields only while this is set. Leaving it set after prep waits ~100 ms
+    // every couple of seconds on later compiles.
+    splash_want.store(0, std::memory_order_release);
+    splash_yield.store(0, std::memory_order_release);
+}
+
+bool splash_init() {
+    if (splash.ready || splash.failed) return splash.ready;
+    if (dev.offscreen || !dev.swapchain || dev.swap_images.empty()) return false;
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = dev.queue_family;
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateCommandPool(dev.device, &pi, nullptr, &splash.pool) != VK_SUCCESS) {
+        splash.failed = true;
+        return false;
+    }
+    ai.commandPool = splash.pool;
+    if (vkAllocateCommandBuffers(dev.device, &ai, &splash.cmd) != VK_SUCCESS ||
+        vkCreateFence(dev.device, &fi, nullptr, &splash.fence) != VK_SUCCESS ||
+        vkCreateSemaphore(dev.device, &si, nullptr, &splash.acquired) != VK_SUCCESS) {
+        splash_stop();
+        splash.failed = true;
+        return false;
+    }
+    splash.ready = true;
+    logf("vk: shader prep draws its progress on the window");
+    return true;
+}
+
+bool splash_buffer(uint32_t width) {
+    constexpr uint32_t kBand = 56;
+    if (splash.map && splash.width == width) return true;
+    splash_free_buffer();
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < dev.memory.memoryTypeCount; i++) {
+        const VkMemoryPropertyFlags f = dev.memory.memoryTypes[i].propertyFlags;
+        if ((f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) return false;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = (VkDeviceSize)width * kBand * 4;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &splash.buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(dev.device, splash.buf, &req);
+    VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ma.allocationSize = req.size;
+    ma.memoryTypeIndex = type;
+    if ((req.memoryTypeBits & (1u << type)) == 0 ||
+        vkAllocateMemory(dev.device, &ma, nullptr, &splash.mem) != VK_SUCCESS ||
+        vkBindBufferMemory(dev.device, splash.buf, splash.mem, 0) != VK_SUCCESS ||
+        vkMapMemory(dev.device, splash.mem, 0, req.size, 0, (void**)&splash.map) != VK_SUCCESS) {
+        splash_free_buffer();
+        return false;
+    }
+    splash.width = width;
+    return true;
+}
+
+void splash_text(uint8_t* px, uint32_t width, uint32_t height, int scale, const char* text, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (!text || !*text || scale < 1) return;
+    const int gw = 6 * scale;
+    const int n = (int)strlen(text);
+    int x = ((int)width - n * gw) / 2;
+    const bool bgra = dev.swap_format == VK_FORMAT_B8G8R8A8_UNORM;
+    for (int i = 0; i < n; i++, x += gw) {
+        const uint8_t* rows = splash_glyph(text[i]);
+        for (int row = 0; row < 7; row++)
+            for (int col = 0; col < 5; col++) {
+                if ((rows[row] & (0x10 >> col)) == 0) continue;
+                for (int dy = 0; dy < scale; dy++)
+                    for (int dx = 0; dx < scale; dx++) {
+                        const int px_x = x + col * scale + dx, px_y = y + row * scale + dy;
+                        if (px_x < 0 || px_y < 0 || px_x >= (int)width || px_y >= (int)height) continue;
+                        uint8_t* p = px + ((size_t)px_y * width + px_x) * 4;
+                        if (bgra) p[0] = b, p[1] = g, p[2] = r;
+                        else p[0] = r, p[1] = g, p[2] = b;
+                        p[3] = 255;
+                    }
+            }
+    }
+}
+
+void splash_title(const char* text) {
+    char title[160];
+    snprintf(title, sizeof title, "Hookshot — %s", text);
+#ifdef _WIN32
+    if (main_window) SetWindowTextA(main_window, title);
+#else
+    if (prep_window && prep_window->version >= 2 && prep_window->set_title)
+        prep_window->set_title(prep_window->window, title);
+#endif
+}
+
+// Set while the RADV driver thread is inside an ICD call. A queue submit then waits on the device
+// lock that call holds, and the wait loop (the stall watchdog, the progress log) never runs.
+std::atomic<int> radv_on_driver{0};
+
+// The acquire succeeded and this call will not present. Submit a wait on the acquire semaphore and
+// present, so the semaphore can be used again and the swapchain image is not held.
+bool splash_release(uint32_t index) {
+    if (index >= dev.swap_images.size() || index >= dev.swap_rendered.size() || !dev.swap_rendered[index] || !splash.cmd)
+        return false;
+    vkResetCommandPool(dev.device, splash.pool, 0);
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(splash.cmd, &cbbi) != VK_SUCCESS) return false;
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = dev.swap_images[index];
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(splash.cmd, &di);
+    if (vkEndCommandBuffer(splash.cmd) != VK_SUCCESS) return false;
+    VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    wait.semaphore = splash.acquired;
+    wait.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    signal.semaphore = dev.swap_rendered[index];
+    signal.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkCommandBufferSubmitInfo cbs{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbs.commandBuffer = splash.cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.waitSemaphoreInfoCount = 1;
+    submit.pWaitSemaphoreInfos = &wait;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cbs;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signal;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &dev.swap_rendered[index];
+    present.swapchainCount = 1;
+    present.pSwapchains = &dev.swapchain;
+    present.pImageIndices = &index;
+    std::lock_guard qk(dev.present_mu);
+    queue_flush_locked();
+    if (vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) != VK_SUCCESS) return false;
+    vkQueuePresentKHR(dev.queue, &present);
+    splash.busy = true;
+    return true;
+}
+
+// A clear plus one small copy. No pipeline is built, so this does not join the shader compiles.
+// Desktop release builds draw this too (precompile_wanted is a release build, or RX_VK_PRECOMPILE).
+// On Windows the PeekMessageA below pumps this thread's queue so the window, created on this thread,
+// paints during prep. Linux leaves window events to the display thread. The picture size is unchanged
+// on desktop; the progress window is the new behaviour.
+void splash_progress(size_t done, size_t total) {
+    if (dev.offscreen || !dev.swapchain) return;
+#ifdef _WIN32
+    MSG msg;
+    while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_PAINT && msg.hwnd) {
+            ValidateRect(msg.hwnd, nullptr);
+            continue;
+        }
+        if (msg.message == WM_ERASEBKGND) continue;
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+#endif
+    char line[120];
+    char eta[48] = "";
+    const auto now = std::chrono::steady_clock::now();
+    if (!total) {
+        snprintf(line, sizeof line, "Preparing shaders");
+    } else {
+        if (splash.phase_total != total || done < 1) {
+            if (splash.phase_total != total) splash.phase_t0 = now, splash.phase_total = total;
+        }
+        const size_t pct = done * 100 / total;
+        snprintf(line, sizeof line, "Preparing shaders: %zu / %zu (%zu%%)", done, total, pct);
+        if (done > 0 && done < total) {
+            const double elapsed = std::chrono::duration<double>(now - splash.phase_t0).count();
+            const double left = elapsed * (double)(total - done) / (double)done;
+            if (elapsed >= 1.0 && left >= 1.0) {
+                if (left >= 90.0) snprintf(eta, sizeof eta, "about %u min left", (unsigned)(left / 60.0 + 0.5));
+                else snprintf(eta, sizeof eta, "about %u s left", (unsigned)(left + 0.5));
+            }
+        }
+    }
+    char both[160];
+    snprintf(both, sizeof both, "%s%s%s", line, eta[0] ? " — " : "", eta);
+    splash_title(both);
+    splash_want.store(1, std::memory_order_release);
+    // A submit during a compile blocks on the device lock that compile holds, and the precompile
+    // wait (its log, its stall watchdog) stops with it. The driver thread yields between creates.
+    const bool turn = splash_yield.load(std::memory_order_acquire) != 0 || radv_on_driver.load(std::memory_order_acquire) == 0;
+    if (!turn) return;
+    if (!splash_init()) {
+        splash_want.store(0, std::memory_order_release);
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    const int pct = total ? (int)(done * 100 / total) : -1;
+    if (splash.last_draw.time_since_epoch().count() != 0 && now - splash.last_draw < std::chrono::milliseconds(250) &&
+        pct == splash.last_pct) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    if (splash.busy && vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 0) != VK_SUCCESS) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    const uint32_t width = dev.swap_extent.width, height = dev.swap_extent.height;
+    constexpr uint32_t kBand = 56;
+    if (!width || !height || !splash_buffer(width)) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    const uint32_t band = std::min(kBand, height);
+    const bool bgra = dev.swap_format == VK_FORMAT_B8G8R8A8_UNORM;
+    uint8_t bg[4] = {18, 20, 26, 255};
+    if (bgra) bg[0] = 26, bg[1] = 20, bg[2] = 18;
+    for (uint32_t i = 0; i < width * band; i++) memcpy(splash.map + (size_t)i * 4, bg, 4);
+    const int scale = width >= 900 ? 2 : 1;
+    splash_text(splash.map, width, band, scale, line, 4, 235, 236, 240);
+    if (eta[0]) splash_text(splash.map, width, band, scale, eta, 4 + 8 * scale, 190, 196, 210);
+    const int bar_y = 4 + 16 * scale + 4;
+    const int bar_h = std::max(6, 4 * scale);
+    const int bar_x = (int)width / 10;
+    const int bar_w = (int)width - 2 * bar_x;
+    auto fill_rect = [&](int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t c[4] = {r, g, b, 255};
+        if (bgra) c[0] = b, c[1] = g, c[2] = r;
+        for (int row = y; row < y + h && row < (int)band; row++) {
+            if (row < 0) continue;
+            for (int col = x; col < x + w && col < (int)width; col++) {
+                if (col < 0) continue;
+                memcpy(splash.map + ((size_t)row * width + col) * 4, c, 4);
+            }
+        }
+    };
+    if (bar_y + bar_h <= (int)band && bar_w > 0) {
+        fill_rect(bar_x, bar_y, bar_w, bar_h, 48, 52, 62);
+        if (total) {
+            int fw = (int)((uint64_t)bar_w * std::min(done, total) / total);
+            if (done && !fw) fw = 1;
+            fill_rect(bar_x, bar_y, fw, bar_h, 232, 146, 42);
+        }
+    }
+    if (splash.busy) vkResetFences(dev.device, 1, &splash.fence), splash.busy = false;
+    const uint64_t acquire_ns = splash.last_draw.time_since_epoch().count() == 0 ? 100000000ull : 0ull;
+    uint32_t index = 0;
+    const VkResult got = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_ns, splash.acquired, VK_NULL_HANDLE, &index);
+    if (got == VK_TIMEOUT || got == VK_NOT_READY || got == VK_ERROR_OUT_OF_DATE_KHR) {
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    const bool acquired = (got == VK_SUCCESS || got == VK_SUBOPTIMAL_KHR) && index < dev.swap_images.size();
+    if (!acquired || index >= dev.swap_rendered.size() || !dev.swap_rendered[index]) {
+        if (acquired) splash_release(index);
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    vkResetCommandPool(dev.device, splash.pool, 0);
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(splash.cmd, &cbbi) != VK_SUCCESS) {
+        splash_release(index);
+        splash.failed = true;
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    auto barrier = [&](VkImageLayout from, VkImageLayout to) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = dev.swap_images[index];
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(splash.cmd, &di);
+    };
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue dark{18 / 255.0f, 20 / 255.0f, 26 / 255.0f, 1.0f};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(splash.cmd, dev.swap_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dark, 1, &range);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.bufferRowLength = width;
+    copy.bufferImageHeight = band;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageOffset = {0, (int32_t)((height - band) / 2), 0};
+    copy.imageExtent = {width, band, 1};
+    vkCmdCopyBufferToImage(splash.cmd, splash.buf, dev.swap_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (vkEndCommandBuffer(splash.cmd) != VK_SUCCESS) {
+        splash_release(index);
+        splash.failed = true;
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    wait.semaphore = splash.acquired;
+    wait.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    signal.semaphore = dev.swap_rendered[index];
+    signal.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkCommandBufferSubmitInfo cbs{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbs.commandBuffer = splash.cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.waitSemaphoreInfoCount = 1;
+    submit.pWaitSemaphoreInfos = &wait;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cbs;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signal;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &dev.swap_rendered[index];
+    present.swapchainCount = 1;
+    present.pSwapchains = &dev.swapchain;
+    present.pImageIndices = &index;
+    bool submitted = false;
+    {
+        std::lock_guard qk(dev.present_mu);
+        queue_flush_locked();
+        submitted = vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) == VK_SUCCESS;
+        if (submitted) vkQueuePresentKHR(dev.queue, &present);
+    }
+    if (!submitted) {
+        // A failed submit does not wait on or signal the semaphores. Present the image plainly.
+        splash.failed = true;
+        splash_release(index);
+        splash_yield.store(0, std::memory_order_release);
+        return;
+    }
+    splash.busy = true;
+    splash.last_draw = now;
+    splash.last_pct = pct;
+    splash_want.store(0, std::memory_order_release);
+    splash_yield.store(0, std::memory_order_release);
+}
+
+void prep_title(size_t done, size_t total, const char* what) {
+#ifndef _WIN32
+    if (!prep_window || prep_window->version < 2 || !prep_window->set_title || !total) return;
+    char title[96];
+    snprintf(title, sizeof title, "Hookshot — %s %zu%%", what, done * 100 / total);
+    prep_window->set_title(prep_window->window, title);
+#else
+    (void)done;
+    (void)total;
+    (void)what;
+#endif
+}
 // (hookshot) hookshot --prepare-shaders (a builder, after a build): the same work with no game, its progress as
 // "@@progress" lines on stdout. A skip there leaves hookshot_prepare_skipped beside the game: its own starts then
 // leave the work out too (what was not prepared is built when first drawn), until a --prepare-shaders run ends it
@@ -398,15 +1078,133 @@ std::string skipped_path() {
     std::string path(exe, n);
     return path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepare_skipped";
 }
+// (hookshot) The first start after an update prepares every shader (prepare_run) and the pipelines the last sessions noted
+// (precompile_run): a minute and more, before the game's first frame. They run on a thread of their own while this one, the
+// renderer's start, shows the window at once with what they are doing on it, and keeps it shown and sized; on Windows it is also
+// the window's thread, and handles its messages meanwhile (it would not answer otherwise). Closing the window stops them
+// (mkwvk_close_asked): what was made is kept, the next start goes on from there. RX_VK_STARTUP_SCREEN=0: as before, all
+// of it before the window shows anything (and a console with the count on Windows)
+std::atomic<int> prep_stage{0};   // 0 the programs, 1 the pipelines the notes predict (a first start), 2 the noted pipelines
+std::atomic<size_t> prep_done{0}, prep_total{0};
+std::atomic<bool> prep_running{false}, prep_finished{false};
+HANDLE prep_ended = nullptr;
+void prep_progress(size_t done, size_t total) {
+    prep_done.store(done, std::memory_order_relaxed);
+    prep_total.store(total, std::memory_order_relaxed);
+}
+bool screen_wanted() {
+    const char* e = getenv("RX_VK_STARTUP_SCREEN");
+    return !e || atoi(e) != 0;
+}
+/// The window's size now (0x0: minimized, or unknown)
+void window_size(uint32_t* w, uint32_t* h) {
+    *w = *h = 0;
+#ifdef _WIN32
+    RECT r{};
+    if (main_window && GetClientRect(main_window, &r)) *w = (uint32_t)(r.right - r.left), *h = (uint32_t)(r.bottom - r.top);
+#else
+    int width = 0, height = 0;
+    if (prep_window) prep_window->drawable_size(prep_window->window, &width, &height);
+    if (width > 0 && height > 0) *w = (uint32_t)width, *h = (uint32_t)height;
+#endif
+}
+void prepare_with_screen() {
+    prep_ended = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    prep_running.store(true);
+    std::thread worker([] {
+        const bool update = prepare_is_update();   // (an update, RX_VK_PREPARE_BACKGROUND=1: what the notes name now, the rest in play)
+        const bool prepared = !update && prepare_run(prep_progress, false);
+        if (prepared && !prepare_stopped()) {   // (a first start only: the pipelines the notes predict, into the driver's cache)
+            prep_done.store(0), prep_total.store(0);
+            prep_stage.store(1);
+            predict_run(prep_progress);
+        }
+        if (!prepare_stopped()) {
+            prep_done.store(0), prep_total.store(0);
+            prep_stage.store(2);
+            precompile_run(prep_progress);
+        }
+        if (prepare_stopped()) pipeline_cache_save(true);   // (the driver's part built so far, for the next start)
+        else if (update) prepare_background();
+        prep_finished.store(true, std::memory_order_release);
+        SetEvent(prep_ended);
+    });
+    // (the screen is drawn and presented on a thread of its own: a present can wait for as long as the window cannot be seen (FIFO
+    // on Wayland, a locked screen), and that must hold neither the window's messages nor the game's start)
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    static std::atomic<bool> paint_stop{false};
+    HANDLE painted = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    std::thread painter([t0, painted] {
+        ProgressClock eta;
+        int eta_stage = -1;
+        double next_log = 10;
+        bool prepared = false;   // (this start prepares the programs: a first start after an update, two steps)
+        uint32_t last_w = dev.swap_extent.width, last_h = dev.swap_extent.height;
+        for (;;) {
+            const bool finished = prep_finished.load(std::memory_order_acquire);
+            const double secs = std::chrono::duration<double>(clock::now() - t0).count();
+            const int stage = prep_stage.load();
+            const size_t done = prep_done.load(std::memory_order_relaxed), total = prep_total.load(std::memory_order_relaxed);
+            if (stage != eta_stage) eta.reset(), eta_stage = stage;
+            if (total) eta.note(secs, done, total);
+            const double left = total ? eta.left() : -1;
+            if (secs >= next_log && total) {
+                logf("vk: start-up: %s %zu of %zu%s%s", stage == 2 ? "pipelines" : stage ? "predicted pipelines" : "shaders", done, total, left >= 0 ? ", " : "",
+                     left_text(left).c_str());
+                next_log = secs + 10;
+            }
+            if (stage == 0 && total) prepared = true;
+            StartupState st;
+            st.stage = stage, st.done = done, st.total = total, st.left = left, st.secs = secs;
+            st.prepared = prepared, st.finished = finished, st.stopping = prepare_stopped();
+            const StartupView view = startup_view(st);
+            startup_screen(&view);
+            uint32_t w, h;
+            window_size(&w, &h);
+            if (w && h && (w != last_w || h != last_h)) {   // (resized: the window's thread leaves it to the renderer, not started yet)
+                dev.swap_resize.store((uint64_t)w << 32 | h, std::memory_order_release);
+                last_w = w, last_h = h;
+            }
+            if (w && h) present_image(nullptr, dev.swap_extent.width, dev.swap_extent.height, nullptr);
+            if (finished || paint_stop.load()) break;
+            Sleep(33);
+        }
+        SetEvent(painted);
+    });
+    // (this thread: the window's messages on Windows, until the work is done)
+    for (;;) {
+#ifdef _WIN32
+        MSG m;
+        while (PeekMessageA(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageA(&m);
+        }
+#endif
+        if (WaitForSingleObject(prep_ended, 33) == WAIT_OBJECT_0) break;
+    }
+    worker.join();
+    paint_stop.store(true);
+    if (WaitForSingleObject(painted, 1000) == WAIT_OBJECT_0) painter.join();
+    else {   // (its present waits for the window to be seen: the game's own presents will, too)
+        logf("vk: start-up: the window is not being shown; the game starts without waiting for it");
+        painter.detach();
+    }
+    startup_screen(nullptr);
+    prep_running.store(false);
+    logf("vk: start-up: the shaders took %.1f s", std::chrono::duration<double>(clock::now() - t0).count());
+}
 bool started_up() {
     if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
     if (prepare_only()) {
-        static int part;   // (two parts: the programs, then the pipelines the notes name; most of the time is the first)
+        // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
+        static int part;
         const auto progress = [](size_t done, size_t total) {
             static size_t last = ~(size_t)0;
             if (!total) return;
-            const size_t at = (part ? 900 : 0) + done * (part ? 100 : 900) / total;
+            static const size_t from[3] = {0, 700, 900}, span[3] = {700, 200, 100};
+            const size_t at = from[part] + done * span[part] / total;
             if (at == last) return;
             last = at;
             printf("@@progress %.3f\n", at / 1000.0);
@@ -415,8 +1213,10 @@ bool started_up() {
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
         part = 0;
-        prepare_run(progress);
+        const bool prepared = prepare_run(progress, false);
         part = 1;
+        if (prepared) predict_run(progress);
+        part = 2;
         precompile_run(progress);
         pipeline_cache_save(true);
         remove(skipped_path().c_str());
@@ -427,7 +1227,11 @@ bool started_up() {
         logf("vk: the shaders' preparation was skipped at the build: left to when each is first drawn");
         return true;
     }
-    if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
+    if (precompile_wanted()) {   // (a release build, preparing shaders before the game: nothing to build during play)
+        if (!dev.offscreen && screen_wanted()) {
+            prepare_with_screen();
+            return true;
+        }
         // (a console while it lasts: there is no window yet, and a long wait with nothing on screen looks like a hang)
         static HANDLE console = nullptr;
         const auto progress = [](size_t done, size_t total) {
@@ -452,18 +1256,53 @@ bool started_up() {
                     if (console == INVALID_HANDLE_VALUE) console = nullptr;
                 }
             }
+            splash_progress(done, total);
+            {   // (in the log too, every 10 s: a run with no window has nothing else to show it)
+                static DWORD next_log = 0;
+                const DWORD now = GetTickCount();
+                if (!next_log) next_log = now + 10000;
+                if ((int32_t)(now - next_log) >= 0) {
+                    logf("vk: start-up: %zu of %zu", done, total);
+                    next_log = now + 10000;
+                }
+            }
             if (!console) return;
             char line[80];
             const int n = snprintf(line, sizeof line, "%cPreparing shaders: %zu of %zu (%zu%%)   ", 13, done, total, done * 100 / total);
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
-        prepare_run(progress);
+        splash_progress(0, 0);
+        const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
+        if (!update && prepare_run(progress, false)) predict_run(progress);
+        if (update) state_list_run();
         precompile_run(progress);
+        if (update) prepare_background();
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
+        splash_stop();
+        prep_title(1, 1, "Hookshot");
+#ifdef _WIN32
+        if (main_window) SetWindowTextA(main_window, "Hookshot");
+#else
+        if (prep_window && prep_window->version >= 2 && prep_window->set_title)
+            prep_window->set_title(prep_window->window, "Hookshot");
+#endif
     }
+    jobs_start();
     return true;
 }
+// (the window's surface made: the presents' own queue kept where its family can present to it, create_device)
+static void choose_present_queue() {
+    if (!dev.present_queue) return;
+    VkBool32 ok = VK_FALSE;
+    if (vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.present_family, dev.surface, &ok) != VK_SUCCESS || !ok) {
+        logf("vk: queue family %u cannot present to the window: presents on the replay's queue", dev.present_family);
+        dev.present_queue = VK_NULL_HANDLE, dev.present_family = dev.queue_family;
+        return;
+    }
+    logf("vk: presents on a queue of their own, of compute family %u (RX_VK_PRESENT_QUEUE=0: off)", dev.present_family);
+}
+
 int start(void* hwnd) {
     main_window = (HWND)hwnd;
     if (!hwnd) {   // (HOS_HEADLESS: no window; the frames are rendered all the same, RX_VK_SHOTS writes them out)
@@ -481,26 +1320,45 @@ int start(void* hwnd) {
     VkBool32 ok = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
     if (!ok) return 0;
+    choose_present_queue();
     RECT r{};
     GetClientRect((HWND)hwnd, &r);
     if (!create_swapchain((uint32_t)(r.right - r.left), (uint32_t)(r.bottom - r.top))) return 0;
 #else
     const MkwVkWindow* w = (const MkwVkWindow*)hwnd;
-    if (w->version != MKWVK_WINDOW_VERSION || !w->create_surface(w->window, (void*)dev.instance, (void*)&dev.surface)) {
-        logf("vk: the window's surface could not be made");
+    prep_window = w;
+    if (w->version != MKWVK_WINDOW_VERSION) {
+        logf("vk: unsupported SDL window bridge version %u (expected %u)", w->version, MKWVK_WINDOW_VERSION);
+        return 0;
+    }
+    if (!w->create_surface(w->window, (void*)dev.instance, (void*)&dev.surface)) {
+        logf("vk: SDL_Vulkan_CreateSurface failed; check SDL_VIDEODRIVER and the Vulkan window-system extensions");
         return 0;
     }
     VkBool32 ok = VK_FALSE;
-    vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
-    if (!ok) {
-        logf("vk: the GPU's queue cannot present to the window");
+    VkResult present = vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
+    if (present != VK_SUCCESS || !ok) {
+        logf("vk: queue-family present support failed (VkResult %d, supported %u)", (int)present, ok);
         return 0;
     }
+    choose_present_queue();
     int width = 0, height = 0;
+    prep_window = w;
     w->drawable_size(w->window, &width, &height);
-    if (!create_swapchain((uint32_t)width, (uint32_t)height)) return 0;
+    if (width <= 0 || height <= 0) {
+        logf("vk: SDL returned zero drawable size %dx%d", width, height);
+        return 0;
+    }
+    if (!create_swapchain((uint32_t)width, (uint32_t)height)) {
+        logf("vk: swapchain creation failed for drawable %dx%d", width, height);
+        return 0;
+    }
 #endif
-    return started_up() ? 1 : 0;
+    if (!started_up()) {
+        logf("vk: renderer startup failed after window and swapchain initialization");
+        return 0;
+    }
+    return 1;
 }
 
 // (the window's thread: only noted. The swapchain is remade by whoever presents next, in present_image: made here, it went from under a
@@ -521,6 +1379,23 @@ MkwVkRenderer table;
 } // namespace
 } // namespace mkwvk
 
+// (hookshot) The window is being closed (host/display.c, host/posix/display_sdl.c, before they end the process): while the
+// shaders are prepared, their workers are stopped and what they made is kept first (10 s at most: a driver can take longer on one
+// pipeline). Looked up by name, so an executable and a back end of different versions still close
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void mkwvk_close_asked(void) {
+    using namespace mkwvk;
+    if (!prep_running.load() || prepare_stopped()) return;
+    logf("vk: the window was closed while the shaders were prepared: stopping, what is done is kept");
+    prepare_stop();
+    if (WaitForSingleObject(prep_ended, 10000) != WAIT_OBJECT_0) logf("vk: the preparation did not stop within 10 s: closing anyway");
+}
+
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -536,13 +1411,39 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    std::set_new_handler([] {
+        logf("vk: C++ allocation failed. This is an out-of-memory failure, not \"window closed\" and not a GPU reset.");
+        std::abort();
+    });
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
          dev.graphics_pipeline_library ? "yes" : "no");
-    if (!dev.mesh_shader && !getenv("RX_VK_NO_MESH_WARNING")) {
+    if (radv_driver()) {
+        if (pipeline_creates_serialized()) {
+            install_radv_driver_thread();
+            logf("vk: pipeline creates serialized (RADV), on one driver thread, with shader modules, layouts and the pipeline cache. RX_VK_PIPELINE_SERIAL=0 leaves them parallel");
+        }
+        const bool vangogh = dev.props.deviceID == 0x163F || std::strstr(dev.props.deviceName, "VANGOGH");
+        logf("vk: RADV%s: task/mesh shaders keep the driver optimizer and publish the task payload with output memory",
+             vangogh ? " on Van Gogh" : "");
+        if (vangogh && !getenv("RX_VK_DECK")) {
+#ifndef _WIN32
+            setenv("RX_VK_DECK", "1", 0);
+            if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
+            if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
+#endif
+            logf("vk: Steam Deck profile (Van Gogh): frame generation off, present cap 45 fps. "
+                 "RX_VK_DECK=0 leaves the Insert menu as it is");
+        }
+    }
+    if (low_mem_on(nullptr))
+        logf("vk: low-memory mode (Deck or under ~13 GiB). Texture budget and staging are tightened. "
+             "RX_VK_LOW_TEX=0, RX_VK_LOW_STAGING=0 and RX_VK_LOW_COMPILE=0 turn those off. RX_VK_LOW_MEM=0 turns them all off.");
+    if (!dev.mesh_shader && !dev.mesh_fallback && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
-        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on)
+        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on.)
+        // (a GPU with no buffer device addresses has no fallback to run either)
         logf("vk: this GPU has no mesh shaders: the game's foliage, grass and many effects cannot be drawn");
 #ifdef _WIN32
         std::thread([name = std::string(dev.props.deviceName)] {
@@ -564,4 +1465,224 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 
 namespace mkwvk {
 HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
+
+bool radv_driver() {
+    // (a call before the device exists must not stick: the id would stay 0 and the lock would never come on)
+    if (!dev.physical) return false;
+    static int id = 0;
+    static bool known = false;
+    if (!known) {
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        id = (int)dp.driverID;
+        known = true;
+    }
+    return id == VK_DRIVER_ID_MESA_RADV;
+}
+
+namespace {
+std::mutex pipeline_create_mu;
+// Set on threads of ours before they call the driver. A thread that never sets it is the driver's
+// own (a compile thread calling back into a hooked entry point) and must not wait on us.
+thread_local bool radv_app_thread = false;
+void radv_note_app_thread() { radv_app_thread = true; }
+}
+bool pipeline_creates_serialized() {
+    if (!dev.physical) return false;
+    static const bool on = [] {
+        if (!radv_driver()) return false;
+        const char* e = getenv("RX_VK_PIPELINE_SERIAL");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+PipelineCreateLock::PipelineCreateLock() {
+    radv_note_app_thread();
+    if (!pipeline_creates_serialized()) return;
+    pipeline_create_mu.lock();
+    held = true;
+}
+PipelineCreateLock::~PipelineCreateLock() {
+    if (held) pipeline_create_mu.unlock();
+}
+
+// (RADV) The prep workers used to take the lock and call the driver on themselves. A compile that keeps going on
+// that thread after vkCreate*Pipelines returns is then beside the next worker's call, which is the crash one thread
+// never hit. Every shader, layout, pipeline and pipeline-cache call is run here instead, on one thread, so the next
+// call joins the last. Translation stays on the workers. The lock above is not taken on this thread.
+namespace {
+thread_local bool on_radv_thread = false;
+std::mutex radv_mu;
+std::condition_variable radv_cv;
+std::deque<std::function<void()>> radv_q;
+std::once_flag radv_once;
+
+void radv_thread_main() {
+    on_radv_thread = true;
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk radv");
+    for (;;) {
+        std::function<void()> job;
+        {
+            std::unique_lock lk(radv_mu);
+            radv_cv.wait(lk, [] { return !radv_q.empty(); });
+            job = std::move(radv_q.front());
+            radv_q.pop_front();
+        }
+        radv_on_driver.fetch_add(1, std::memory_order_acq_rel);
+        job();
+        radv_on_driver.fetch_sub(1, std::memory_order_acq_rel);
+        // Between creates, give the progress bar a moment. Submitting while this thread is inside
+        // the ICD waits on the lock that call holds, so the bar used to stay on its first frame.
+        if (splash_want.load(std::memory_order_acquire) != 0) {
+            static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(3);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(2)) {
+                last = now;
+                splash_yield.store(1, std::memory_order_release);
+                const auto until = now + std::chrono::milliseconds(100);
+                while (splash_yield.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                splash_yield.store(0, std::memory_order_release);
+            }
+        }
+    }
+}
+void radv_ensure_thread() {
+    std::call_once(radv_once, [] { std::thread(radv_thread_main).detach(); });
+}
+template <class F>
+auto radv_drive(F fn) -> decltype(fn()) {
+    using R = decltype(fn());
+    // Re-entry from this thread runs here. Every other call, including one from a thread that never
+    // took PipelineCreateLock, waits its turn on this thread. The hooks are only our vkx:: table, so
+    // a RADV compile thread does not call them; running an unmarked thread of ours inline was the
+    // concurrency the driver thread exists to stop. The log says when that happens.
+    if (on_radv_thread) return fn();
+    if (!radv_app_thread) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 4)
+            logf("vk: radv: an unmarked thread's driver call is queued on the driver thread");
+    }
+    radv_ensure_thread();
+    auto prom = std::make_shared<std::promise<R>>();
+    std::future<R> fut = prom->get_future();
+    {
+        std::lock_guard lk(radv_mu);
+        radv_q.push_back([fn, prom]() mutable {
+            try {
+                if constexpr (std::is_void_v<R>) {
+                    fn();
+                    prom->set_value();
+                } else {
+                    prom->set_value(fn());
+                }
+            } catch (...) {
+                prom->set_exception(std::current_exception());
+            }
+        });
+    }
+    radv_cv.notify_one();
+    return fut.get();
+}
+
+#define RADV_RESULT(name, formal, actual)                                                                                  \
+    PFN_##name real_##name = nullptr;                                                                                      \
+    VkResult VKAPI_CALL name##_thr formal { return radv_drive([=] { return real_##name actual; }); }
+#define RADV_VOID(name, formal, actual)                                                                                    \
+    PFN_##name real_##name = nullptr;                                                                                      \
+    void VKAPI_CALL name##_thr formal { radv_drive([=] { real_##name actual; }); }
+
+RADV_RESULT(vkCreateShaderModule,
+            (VkDevice device, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* alloc, VkShaderModule* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyShaderModule, (VkDevice device, VkShaderModule mod, const VkAllocationCallbacks* alloc), (device, mod, alloc))
+RADV_RESULT(vkCreateDescriptorSetLayout,
+            (VkDevice device, const VkDescriptorSetLayoutCreateInfo* info, const VkAllocationCallbacks* alloc, VkDescriptorSetLayout* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyDescriptorSetLayout, (VkDevice device, VkDescriptorSetLayout layout, const VkAllocationCallbacks* alloc),
+          (device, layout, alloc))
+RADV_RESULT(vkCreatePipelineLayout,
+            (VkDevice device, const VkPipelineLayoutCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipelineLayout* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyPipelineLayout, (VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks* alloc), (device, layout, alloc))
+RADV_RESULT(vkCreateGraphicsPipelines,
+            (VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo* info, const VkAllocationCallbacks* alloc,
+             VkPipeline* out),
+            (device, cache, n, info, alloc, out))
+RADV_RESULT(vkCreateComputePipelines,
+            (VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo* info, const VkAllocationCallbacks* alloc,
+             VkPipeline* out),
+            (device, cache, n, info, alloc, out))
+RADV_VOID(vkDestroyPipeline, (VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* alloc), (device, pipeline, alloc))
+RADV_RESULT(vkCreatePipelineCache,
+            (VkDevice device, const VkPipelineCacheCreateInfo* info, const VkAllocationCallbacks* alloc, VkPipelineCache* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroyPipelineCache, (VkDevice device, VkPipelineCache cache, const VkAllocationCallbacks* alloc), (device, cache, alloc))
+RADV_RESULT(vkGetPipelineCacheData, (VkDevice device, VkPipelineCache cache, size_t* size, void* data), (device, cache, size, data))
+RADV_RESULT(vkCreateSampler, (VkDevice device, const VkSamplerCreateInfo* info, const VkAllocationCallbacks* alloc, VkSampler* out),
+            (device, info, alloc, out))
+RADV_VOID(vkDestroySampler, (VkDevice device, VkSampler sampler, const VkAllocationCallbacks* alloc), (device, sampler, alloc))
+#undef RADV_RESULT
+#undef RADV_VOID
+} // namespace
+
+void install_radv_driver_thread() {
+    static bool installed = false;
+    if (installed || !pipeline_creates_serialized()) return;
+    installed = true;
+    radv_note_app_thread(); // the renderer thread (prep, the precompile's load, presents)
+#define RADV_INSTALL(name)                                                                                                 \
+    do {                                                                                                                   \
+        if (vkx::name) {                                                                                                   \
+            real_##name = vkx::name;                                                                                       \
+            vkx::name = &name##_thr;                                                                                       \
+        }                                                                                                                  \
+    } while (0)
+    RADV_INSTALL(vkCreateShaderModule);
+    RADV_INSTALL(vkDestroyShaderModule);
+    RADV_INSTALL(vkCreateDescriptorSetLayout);
+    RADV_INSTALL(vkDestroyDescriptorSetLayout);
+    RADV_INSTALL(vkCreatePipelineLayout);
+    RADV_INSTALL(vkDestroyPipelineLayout);
+    RADV_INSTALL(vkCreateGraphicsPipelines);
+    RADV_INSTALL(vkCreateComputePipelines);
+    RADV_INSTALL(vkDestroyPipeline);
+    RADV_INSTALL(vkCreatePipelineCache);
+    RADV_INSTALL(vkDestroyPipelineCache);
+    RADV_INSTALL(vkGetPipelineCacheData);
+    RADV_INSTALL(vkCreateSampler);
+    RADV_INSTALL(vkDestroySampler);
+#undef RADV_INSTALL
+    radv_ensure_thread();
+}
+
+bool radv_mesh_payload_barrier() {
+    const char* e = getenv("RX_VK_MESH_PAYLOAD_BARRIER");
+    if (e && e[0]) return std::atoi(e) != 0;
+    return radv_driver();
+}
+
+bool low_mem_on(const char* off_switch) {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_LOW_MEM");
+        if (e && e[0]) return std::atoi(e) != 0 ? 1 : 0;
+        if (const char* d = getenv("RX_VK_DECK"); d && d[0] != '0') return 1;
+#ifndef _WIN32
+        if (FILE* f = fopen("/proc/meminfo", "r")) {
+            char line[128];
+            unsigned long long kb = 0;
+            while (fgets(line, sizeof line, f))
+                if (sscanf(line, "MemTotal: %llu", &kb) == 1) break;
+            fclose(f);
+            if (kb && kb < 13ull * 1024 * 1024) return 1;
+        }
+#endif
+        return 0;
+    }();
+    if (!mode) return false;
+    const char* e = off_switch ? getenv(off_switch) : nullptr;
+    return !(e && e[0] == '0');
+}
 } // namespace mkwvk

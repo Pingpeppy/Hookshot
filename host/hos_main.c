@@ -5,11 +5,14 @@
    guest main thread, run every module's DT_INIT in rtld's order (the SDK crt's _init: TLS registration with musl,
    then the module's constructors), then nninitStartup and nnMain.
 
-   Usage: <game>.exe image.bin --romfs <dir> --user <dir>
+   Usage: <game>.exe [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]
    Environment: HOS_TRACE=1 (log HLE calls), HOS_MEMORY_MB (memory the game is told it has),
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
 #include "hos_paths.h"
+#include "../gpu/vk/vk_api.h"
+#include "../gpu/vk/oot_cheat_items.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +26,14 @@
 #else
 #include <windows.h>   /* (linux: host/posix's) */
 #include <sys/mman.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #endif
 /* (linux) the separator of the paths the executable's folder is joined with */
 #ifdef _WIN32
@@ -102,6 +113,9 @@ static void *reserve_large(SIZE_T size) {
 }
 #endif
 
+#if !defined(_WIN32) && !defined(A64_MEM_ZERO)
+extern int hos_guest_memfd;   /* (below) */
+#endif
 /* The guest window lives at the constant A64_HOST_BASE (rt/a64.h), so lifted code never loads its base. */
 static int reserve_guest(void) {
 #if defined(A64_MEM_ZERO)
@@ -130,6 +144,50 @@ static int reserve_guest(void) {
        step: MAP_NORESERVE). Decommitting is madvise (host/posix/win32_posix.c VirtualFree): the pages read as zero. */
     void hos_commit_init(void);
     hos_commit_init();   /* (the crash report) */
+    /* The window is a memfd's, shared, so the Vulkan back end can hand the GPU the game's own pages as a dma-buf
+       (udmabuf, gpu/vk/vk_memory.cpp import_dma_buf) instead of a host pointer: amdgpu checks every page of a host-pointer
+       import again at each command submission, 15-45 ms a submission in Kokiri Forest. Pages of a shared mapping are freed
+       with MADV_REMOVE, not MADV_DONTNEED (hos_posix_guest_discard). HOS_GUEST_MEMFD=0: anonymous memory, as before */
+    {
+        /* (only where /dev/udmabuf can be opened: a shared mapping's pages cannot be host-pointer imports (RADV:
+           VK_ERROR_INVALID_EXTERNAL_HANDLE), so a pool udmabuf refused would be no import at all. A pool larger than udmabuf's
+           size_limit_mb (64 MB unless raised) is imported as several dma-bufs bound into one sparse buffer, so no setting is
+           needed. HOS_GUEST_MEMFD=1: the memfd all the same) */
+        const char *e = getenv("HOS_GUEST_MEMFD");
+        int usable = 0;
+        unsigned long long limit_mb = 0;
+        {
+            const int u = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+            if (u >= 0) {
+                close(u);
+                FILE *f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r");
+                if (f) {
+                    if (fscanf(f, "%llu", &limit_mb) != 1) limit_mb = 0;
+                    fclose(f);
+                }
+                usable = limit_mb > 0;
+            }
+            if (!usable && !e)
+                hos_log("mem: guest memory stays host-pointer imports for the GPU (slow submissions on AMD): %s",
+                        u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb cannot be read");
+        }
+        if (e ? atoi(e) != 0 : usable) {
+            const int fd = (int)syscall(SYS_memfd_create, "hookshot-guest", 1u /* MFD_CLOEXEC */ | 2u /* MFD_ALLOW_SEALING */);
+            if (fd >= 0 && ftruncate(fd, (off_t)GUEST_SPACE) == 0) {
+                fcntl(fd, 1033 /* F_ADD_SEALS */, 0x0002 /* F_SEAL_SHRINK */ | 0x0004 /* F_SEAL_GROW */);
+                void *p = mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, fd, 0);
+                if (p == (void *)A64_HOST_BASE) {
+                    hos_guest_memfd = fd;
+                    hos_log("mem: the guest window is a memfd's (%d), shared with the GPU as dma-bufs", fd);
+                    return 1;
+                }
+                if (p != MAP_FAILED) munmap(p, GUEST_SPACE);
+            }
+            if (fd >= 0) close(fd);
+            hos_log("mem: no memfd for the guest window (errno %d): anonymous memory", errno);
+        }
+    }
     if (mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) != (void *)A64_HOST_BASE)
         return 0;
@@ -137,9 +195,24 @@ static int reserve_guest(void) {
        collapse khugepaged makes in them changes their mappings, which the kernel answers by pinning the pages again at the
        next submission: ~250 ms a submit on RADV while the GPU sat idle. HOS_THP=1: as before */
     if (!getenv("HOS_THP")) madvise((void *)A64_HOST_BASE, GUEST_SPACE, MADV_NOHUGEPAGE);
+#ifdef __linux__
+    /* (HOS_NO_THP=1, experiment: none outside the window either. With THP "always" 400-450 MB of the host heap's and the binary's bss are huge
+       pages, each resident whole when any of its 2 MB is touched) */
+    if (getenv("HOS_NO_THP")) prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
     return 1;
 #endif
 }
+
+#if !defined(_WIN32) && !defined(A64_MEM_ZERO)
+/* the guest window's memfd for the Vulkan back end (-1: anonymous memory), and freeing guest pages so that
+   they read as zero again on either kind of mapping */
+int hos_guest_memfd = -1;
+int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
+int hos_posix_guest_discard(void *p, size_t n) {
+    return madvise(p, n, hos_guest_memfd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
+}
+#endif
 
 /* The guest window, for the renderer (gpu/render/rx_buffer.cpp). */
 uint8_t *hos_guest_base(void) { return A64_MEM; }
@@ -272,12 +345,19 @@ static const char *saves_dir(const char *beside) {
 
 /* hookshot_env.txt beside the game: NAME=VALUE lines set as environment variables before anything reads them, for the
    switches players are asked to test (RX_VK_NOOPT and the rest). Lines starting with # are notes. On Linux this runs
-   before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made. */
+   before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made.
+   HOS_ENV_FILE=<path> reads that file instead: a scripted or A/B test run brings its own switches and leaves the
+   player's hookshot_env.txt as it is. */
 static void load_hookshot_env(void) {
     char path[MAX_PATH + 32];
-    DWORD n = hos_game_path_a(path, MAX_PATH);
-    while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-    memcpy(path + n, "hookshot_env.txt", 17);
+    const char *other = getenv("HOS_ENV_FILE");
+    if (other && *other) {
+        snprintf(path, sizeof path, "%s", other);
+    } else {
+        DWORD n = hos_game_path_a(path, MAX_PATH);
+        while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
+        memcpy(path + n, "hookshot_env.txt", 17);
+    }
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[512];
@@ -299,9 +379,785 @@ static void load_hookshot_env(void) {
     fclose(f);
 }
 
+int hos_oot_protect_hearts;
+volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat <action>": host/nn_hid.c */
+
+int hos_oot_hearts_enabled(void) {
+    int rx_option(int id, int otherwise);
+    const int menu = rx_option(HOS_OPT_CHEAT_HEARTS, -1);
+    return menu < 0 ? hos_oot_protect_hearts : menu;
+}
+
+int hos_oot_is_player(Ctx *c, uint64_t actor) {
+    if (recomp_load64(c, actor) != 0x84b6c460ULL) return 0;
+    // Other actors share this vtable. The actor's resource record identifies Link.
+    const uint64_t resource = recomp_load64(c, actor + 16);
+    return resource && recomp_load32(c, resource + 88) == 0x79616c50 &&
+           recomp_load16(c, resource + 92) == 0x7265 &&
+           recomp_load8(c, resource + 94) == 0;
+}
+
+#ifdef _WIN32
+/* OneShotAddOrRemovePouchContent (f_828d4a70) for one pouch content by actor name: delta > 0 adds, < 0 removes.
+   Returns the event status (top bits of the result word), or -1 when the pouch is not ready. */
+static int oot_pouch_change(Ctx *c, const char *name, int delta) {
+    const uint64_t pouch_singleton = recomp_load64(c, 0x84c9e0d0ULL);
+    const uint64_t state_singleton = recomp_load64(c, 0x84c9e2a8ULL);
+    const uint64_t actor_db = recomp_load64(c, 0x84eb6888ULL);
+    const uint64_t actor_info = recomp_load64(c, 0x84e8c060ULL);
+    A64Fn edit = a64_lookup(0x828d4a70ULL);
+    if (!edit || !pouch_singleton || !recomp_load64(c, pouch_singleton) ||
+        !state_singleton || !recomp_load64(c, state_singleton) || !actor_db || !actor_info || !delta ||
+        strlen(name) >= 0x60) return -1;
+
+    // OneShotAddOrRemovePouchContent reads the event parameters through pointers.
+    const Ctx saved = *c;
+    const uint64_t event = (c->x[31] - 0xe0) & ~0xfULL;
+    memset(A64_PTR(event), 0, 0xe0);
+    memcpy(A64_PTR(event + 0x80), name, strlen(name) + 1);
+    recomp_store64_sp(c, event + 0x20, event + 0x60);
+    recomp_store64_sp(c, event + 0x30, event + 0x70);
+    recomp_store64_sp(c, event + 0x38, event + 0x68);
+    recomp_store64_sp(c, event + 0x48, event + 0x74);
+    recomp_store64_sp(c, event + 0x50, event + 0x74);
+    recomp_store64_sp(c, event + 0x60, event + 0x80);
+    recomp_store64_sp(c, event + 0x68, 0x83f0a6d8ULL); // Script
+    recomp_store32_sp(c, event + 0x70, (uint32_t)delta);
+    c->x[31] = event;
+    c->x[0] = event;
+    edit(c);
+    const int result = (int)(recomp_load32(c, event + 0x18) >> 30);
+    *c = saved;
+    return result;
+}
+
+/* QueryGetPouchContentNumByActorName (f_82a3c260): f_805b63e0(pouch manager, &name, 0, 0) counts one content. */
+static int oot_pouch_count(Ctx *c, const char *name) {
+    const uint64_t manager = recomp_load64(c, 0x84e98e28ULL);
+    A64Fn count = a64_lookup(0x805b63e0ULL);
+    if (!manager || !count || strlen(name) >= 0x60) return -1;
+    const Ctx saved = *c;
+    const uint64_t frame = (c->x[31] - 0x80) & ~0xfULL;
+    memcpy(A64_PTR(frame + 0x10), name, strlen(name) + 1);
+    recomp_store64_sp(c, frame, frame + 0x10);
+    c->x[31] = frame;
+    c->x[0] = manager, c->x[1] = frame, c->x[2] = 0, c->x[3] = 0;
+    count(c);
+    const int n = (int)(int32_t)c->x[0];
+    *c = saved;
+    return n;
+}
+
+static void oot_edit_pouch(Ctx *c, int action) {
+    static const char *const items[] = {
+        "Item_DekuSeed", "Item_DekuNut", "Item_DekuStick", "Item_Bomb", "Item_Arrow_Normal"
+    };
+    const unsigned item = (unsigned)(action - 200) / 32;
+    const int delta = (action - 200) % 32 - 10;
+    if (item >= sizeof items / sizeof items[0] || !delta || delta < -10 || delta > 10) return;
+    const int result = oot_pouch_change(c, items[item], delta);
+    if (result >= 0) hos_log("cheats: pouch %s %+d (event status %d)", items[item], delta, result);
+}
+
+/* The Inventory page (gpu/vk/oot_cheat_items.h): counts go to the menu twice a second, edits come back as actions. */
+#define OOT_ITEM_NAME(label, name, kind) name,
+#define OOT_ITEM_KIND(label, name, kind) kind,
+#define OOT_NO_SECTION(name)
+static const char *const oot_item_names[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, OOT_ITEM_NAME)};
+static const unsigned char oot_item_kinds[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, OOT_ITEM_KIND)};
+#define OOT_ITEM_COUNT (sizeof oot_item_names / sizeof oot_item_names[0])
+
+static int oot_item_count(Ctx *c, const char *name);
+
+static void oot_inventory_refresh(Ctx *c, int64_t now) {
+    void rx_option_set(int id, int value);
+    static int64_t next;
+    static int probed;
+    if (now < next) return;
+    next = now + 500000000LL;
+    for (unsigned i = 0; i < OOT_ITEM_COUNT; i++) rx_option_set(OOT_CHEAT_ITEM_BASE + (int)i, oot_item_count(c, oot_item_names[i]));
+    if (!probed && oot_pouch_count(c, "Item_DekuSeed") >= 0) {
+        probed = 1;   /* (one line naming every count, both spellings: which names the pouch knows) */
+        static const char *const probes[] = {OOT_CHEAT_ITEM_PROBES};
+        const unsigned total = (unsigned)(OOT_ITEM_COUNT + sizeof probes / sizeof probes[0]);
+        char line[512];
+        size_t used = 0;
+        for (unsigned i = 0; i < total; i++) {   /* (several short lines: the log cuts long ones) */
+            const char *name = i < OOT_ITEM_COUNT ? oot_item_names[i] : probes[i - OOT_ITEM_COUNT];
+            used += (size_t)snprintf(line + used, sizeof line - used, " %s=%d", name, oot_pouch_count(c, name));
+            if (used > 300 || i + 1 == total) hos_log("cheats: inventory probe:%s", line), used = 0;
+        }
+    }
+}
+
+/* Masks share one slot (the Happy Mask Shop lends one at a time). The game takes "Item_Mask_X" when adding one and
+   may keep it as "Armor_Child_Mask_X", so both spellings count and a new mask first returns the one held. */
+static int oot_mask_alias(const char *name, char *alias, size_t size) {
+    if (!strncmp(name, "Armor_Child_Mask_", 17)) return snprintf(alias, size, "Item_Mask_%s", name + 17), 1;
+    return 0;
+}
+
+static int oot_item_count(Ctx *c, const char *name) {
+    char alias[64];
+    const int n = oot_pouch_count(c, name);
+    if (!oot_mask_alias(name, alias, sizeof alias)) return n;
+    const int m = oot_pouch_count(c, alias);
+    return n > m ? n : m;
+}
+
+static void oot_inventory_edit(Ctx *c, int action) {
+    const unsigned item = (unsigned)(action - OOT_CHEAT_ITEM_ACTION) / 256, op = (unsigned)(action - OOT_CHEAT_ITEM_ACTION) % 256;
+    if (item >= OOT_ITEM_COUNT) return;
+    const char *name = oot_item_names[item];
+    char alias[64];
+    const int is_mask = oot_mask_alias(name, alias, sizeof alias);
+    const int have = oot_item_count(c, name);
+    int delta = 0;
+    if (op == 200) delta = have > 0 ? -have : 1;   /* unlock / relock */
+    else if (op < 128) delta = (int)op - 64;
+    if (!delta || have < 0) return;
+    if (is_mask && delta > 0) {   /* return whichever mask is in the slot first */
+        for (unsigned i = 0; i < OOT_ITEM_COUNT; i++) {
+            char other_alias[64];
+            if (i == item || !oot_mask_alias(oot_item_names[i], other_alias, sizeof other_alias)) continue;
+            const char *spellings[2] = {oot_item_names[i], other_alias};
+            for (unsigned k = 0; k < 2; k++) {
+                const int held = oot_pouch_count(c, spellings[k]);
+                if (held > 0) hos_log("cheats: inventory returned %s (status %d)", spellings[k], oot_pouch_change(c, spellings[k], -held));
+            }
+        }
+        delta = 1;
+    }
+    int result = -1;
+    if (is_mask && delta < 0) {   /* remove under whichever spelling holds it */
+        const char *spellings[2] = {name, alias};
+        for (unsigned k = 0; k < 2; k++) {
+            const int held = oot_pouch_count(c, spellings[k]);
+            if (held > 0) result = oot_pouch_change(c, spellings[k], -held);
+        }
+    } else {
+        result = oot_pouch_change(c, is_mask ? alias : name, delta);   /* (masks are added as Item_Mask_X, as the shop does) */
+    }
+    hos_log("cheats: inventory %s %+d (had %d, now %d, event status %d)", name, delta, have, oot_item_count(c, name), result);
+}
+
+static void oot_set_time(Ctx *c, unsigned hour) {
+    // ExecuteWmSetTime passes seconds since midnight to the world manager.
+    const uint64_t singleton = recomp_load64(c, 0x84c9e898ULL);
+    const uint64_t world = singleton ? recomp_load64(c, singleton) : 0;
+    A64Fn set_time = a64_lookup(0x834722d0ULL);
+    if (!set_time || !world || !recomp_load64(c, world + 0x510)) {
+        hos_log("cheats: world clock unavailable");
+        return;
+    }
+    const Ctx saved = *c;
+    c->x[0] = world;
+    c->x[1] = hour * 3600;
+    set_time(c);
+    *c = saved;
+    hos_log("cheats: requested %02u:00", hour);
+}
+
+/* Cross-map teleport (build e0f3ccfa). Map changes in this game only run through an event: an entrance actor
+   requests the Dm_SY_BancChangeGo event with NextBanc / NextStartPos / BootEventName arguments, the event calls
+   GameSystemActor's ReserveBancChange, and the sequence's ChangeBancOnEvent loads the map when the event ends.
+   This builds the same event request (see work/oot-teleport-research.md). The menu labels in gpu/vk/vk_menu.cpp
+   (teleport_names) follow this table's order. */
+typedef struct {
+    const char *child_banc, *child_start, *child_boot;
+    const char *adult_banc, *adult_start, *adult_boot;
+} OotDestination;
+static const OotDestination oot_destinations[] = {   /* (generated: work/oot-teleport-tools/write_destinations.py) */
+    {"KokiriForest_Child", "LostWoodBridge_FrontOfHyruleField", "Dm_SY_BancChangeArrive",
+     "KokiriForest_Adult", "LostWoodBridge_FrontOfHyruleField", "Dm_SY_BancChangeArrive"},   /* Kokiri Forest */
+    {"HyruleField_Child", "HyruleField_FrontOfLostWoodBridge", "Dm_SY_BancChangeArrive",
+     "HyruleField_Adult", "HyruleField_FrontOfLostWoodBridge", "Dm_SY_BancChangeArrive"},   /* Hyrule Field */
+    {"KakarikoVillage_Child", "KakarikoVillage_Entrance", "Dm_SY_BancChangeArrive_KakarikoVillage_01",
+     "KakarikoVillage_Adult", "KakarikoVillage_Entrance", "Dm_SY_BancChangeArrive_KakarikoVillage_01"},   /* Kakariko Village */
+    {"Market_Child", "Market_Entrance", "Dm_SY_BancChangeArrive_Market_02",
+     "Market_Adult", "Market_Entrance", "Dm_SY_BancChangeArrive_Market_02"},   /* Market */
+    {"HyruleCastle", "HyruleCastle_Entrance", "Dm_SY_BancChangeArrive_HyruleCastle_01",
+     "GanonCastle", "GanonCastleEntrance", "Dm_SY_BancChangeArrive_GanonCastle_01"},   /* Hyrule Castle */
+    {"LostWood_Child", "LostWood_FrontOfSacredForestMeadow", "Dm_SY_BancChangeArrive_LostWood",
+     "LostWood_Adult", "LostWood_FrontOfSacredForestMeadow", "Dm_SY_BancChangeArrive_LostWood"},   /* Lost Woods */
+    {"SacredForestMeadow_Child", "OutsideOfForestTemple", "Dm_SY_BancChangeArrive_SacredForestMeadow_01",
+     "SacredForestMeadow_Adult", "OutsideOfForestTemple", "Dm_SY_BancChangeArrive_SacredForestMeadow_01"},   /* Sacred Forest Meadow */
+    {"HyruleField_Child", "LakeHylia_FromGerudoValley", "Dm_SY_BancChangeArrive_LakeHylia_02",
+     "HyruleField_Adult", "LakeHylia_FromGerudoValley", "Dm_SY_BancChangeArrive_LakeHylia_02"},   /* Lake Hylia */
+    {"Graveyard_Child", "GraveYard_KakarikoSide", "Dm_SY_BancChangeArrive_Graveyard_01",
+     "Graveyard_Adult", "GraveYard_KakarikoSide", "Dm_SY_BancChangeArrive_Graveyard_01"},   /* Graveyard */
+    {"DeathMountainTrail_Child", "MountainTrail_KakarikoSide", "Dm_SY_BancChangeArrive_DeathMountainTrail_01",
+     "DeathMountainTrail_Adult", "MountainTrail_KakarikoSide", "Dm_SY_BancChangeArrive_DeathMountainTrail_01"},   /* Death Mountain Trail */
+    {"DeathMountainCrater_Child", "Crater_GoronCitySide", "DeathMountainCrater_Arrive",
+     "DeathMountainCrater_Adult", "Crater_GoronCitySide", "DeathMountainCrater_Arrive"},   /* Death Mountain Crater */
+    {"GoronCity_Child", "GoronCity_MountainTrailSide", "Dm_SY_BancChangeArrive_GoronCity_01",
+     "GoronCity_Adult", "GoronCity_MountainTrailSide", "Dm_SY_BancChangeArrive_GoronCity_01"},   /* Goron City */
+    {"ZoraRiver_Child", "ZoraRiver_Entrance", "Dm_SY_BancChangeArrive",
+     "ZoraRiver_Adult", "ZoraRiver_Entrance", "Dm_SY_BancChangeArrive"},   /* Zora's River */
+    {"ZoraDomain_Child", "ZoraDomain_FromZoraRiver", "Dm_SY_BancChangeArrive",
+     "ZoraDomain_Adult", "ZoraDomain_FromZoraRiver", "Dm_SY_BancChangeArrive"},   /* Zora's Domain */
+    {"ZoraFountain_Child", "ZoraFountain_FromZoraDomain", "Dm_SY_BancChangeArrive",
+     "ZoraFountain_Adult", "ZoraFountain_FromZoraDomain", "Dm_SY_BancChangeArrive"},   /* Zora's Fountain */
+    {"GerudoValley_Child", "GerudoValley_Entrance", "FromHyruleField_ArriveGerudoValley",
+     "GerudoValley_Adult", "GerudoValley_Entrance", "FromHyruleField_ArriveGerudoValley"},   /* Gerudo Valley */
+    {NULL, NULL, NULL,
+     "GerudoFortress_Adult", "GerudoFortress_FromHountedWasteland", "Dm_SY_BancChangeArrive_GerudoFortress_02"},   /* Gerudo Fortress */
+    {"HountedWasteland_Child", "HountedWasteland_FromGerudoFortress", "FromGerudoFortress_ArriveWateland",
+     "HountedWasteland_Adult", "HountedWasteland_FromGerudoFortress", "FromGerudoFortress_ArriveWateland"},   /* Haunted Wasteland */
+    {"DesertColossus_Child", "DesertColossus_FromHountedWasteland", "Dm_SY_BancChangeArrive_DesertColossus_01",
+     "DesertColossus_Adult", "DesertColossus_FromHountedWasteland", "Dm_SY_BancChangeArrive_DesertColossus_01"},   /* Desert Colossus */
+    {"InsideTheDekuTree", "Entrance", "Dm_SY_BancChangeArrive_InsideTheDekuTree_01",
+     "InsideTheDekuTree", "Entrance", "Dm_SY_BancChangeArrive_InsideTheDekuTree_01"},   /* Inside the Deku Tree */
+    {"DodongoCavern", "DodongoCavern_MountainTrailSide", "Dm_SY_BancChangeArrive",
+     "DodongoCavern", "DodongoCavern_MountainTrailSide", "Dm_SY_BancChangeArrive"},   /* Dodongo's Cavern */
+    {"InsideJabuJabuBelly", "InsideJabuJabuBelly_FromZoraFountain", "Dm_SY_BancChangeArrive",
+     "InsideJabuJabuBelly", "InsideJabuJabuBelly_FromZoraFountain", "Dm_SY_BancChangeArrive"},   /* Jabu-Jabu's Belly */
+    {"ForestTemple", "ForestTemple", "Dm_SY_BancChangeArrive",
+     "ForestTemple", "ForestTemple", "Dm_SY_BancChangeArrive"},   /* Forest Temple */
+    {"FireTemple", "FireTemple", "Dm_SY_BancChangeArrive",
+     "FireTemple", "FireTemple", "Dm_SY_BancChangeArrive"},   /* Fire Temple */
+    {"WaterTemple", "WaterTemple_FromLakeHylia", "SageOfWater_Arrival_WaterTemple",
+     "WaterTemple", "WaterTemple_FromLakeHylia", "SageOfWater_Arrival_WaterTemple"},   /* Water Temple */
+    {"ShadowTemple", "Entrance", "ShadowTemple_Arrive",
+     "ShadowTemple", "Entrance", "ShadowTemple_Arrive"},   /* Shadow Temple */
+    {"SpiritTemple", "SpiritTemple_FromRightHand", "Dm_SY_BancChangeArrive",
+     "SpiritTemple", "SpiritTemple_FromRightHand", "Dm_SY_BancChangeArrive"},   /* Spirit Temple */
+    {"BottomOfTheWell", "Well_KakarikoSide", "Dm_SY_BancChangeArrive",
+     "BottomOfTheWell", "Well_KakarikoSide", "Dm_SY_BancChangeArrive"},   /* Bottom of the Well */
+    {"IceCavern", "IceCavern_FromZoraFountain", "SageOfWater_Arrival_IceCavern",
+     "IceCavern", "IceCavern_FromZoraFountain", "SageOfWater_Arrival_IceCavern"},   /* Ice Cavern */
+    {"GerudoTrainingGround", "GerudoTrainingGround_FromGerudoFortress", "FromGerudoFortress_ArriveTrainingGround",
+     "GerudoTrainingGround", "GerudoTrainingGround_FromGerudoFortress", "FromGerudoFortress_ArriveTrainingGround"},   /* Gerudo Training Ground */
+    {"InsideGanonCastle", "Entrance", "Dm_SY_BancChangeArrive_InsideGanonCastle_01",
+     "InsideGanonCastle", "Entrance", "Dm_SY_BancChangeArrive_InsideGanonCastle_01"},   /* Ganon's Castle */
+};
+#define OOT_AGE_ACTION 999   /* (the Cheats page's Age row) */
+#define OOT_TELEPORT_ACTION 1000   /* (pouch edits use 200 to 348) */
+#define OOT_GAMEDATA_SLOT 0x84c9e180ULL   /* GameDataMgr, as ReserveBancChange's readers load it */
+#define OOT_EVENTMGR_SLOT 0x84c9e090ULL   /* EventMgr, as SeqOneShotRequestEvent loads it */
+#define OOT_EVENT_ARG_SIZE 0x1b20ULL      /* EventRequestArg: SeqOneShotRequestEvent reserves this much stack */
+
+static uint64_t oot_singleton(Ctx *c, uint64_t slot) {
+    const uint64_t holder = recomp_load64(c, slot);
+    return holder ? recomp_load64(c, holder) : 0;
+}
+
+/* GameDataMgr getters by MurMur3 name hash: f_8022d9c0 (bool) and f_80cd0ea0 (String64). 1 when found. */
+static int oot_gamedata_bool(Ctx *c, uint32_t hash, int *value) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    A64Fn get = a64_lookup(0x8022d9c0ULL);
+    if (!mgr || !get) return 0;
+    const Ctx saved = *c;
+    const uint64_t out = (c->x[31] - 0x40) & ~0xfULL;
+    recomp_store64_sp(c, out, 0);
+    c->x[31] = out;
+    c->x[0] = mgr, c->x[1] = out, c->x[2] = hash;
+    get(c);
+    const int found = (int)(c->x[0] & 1);
+    *value = recomp_load8(c, out) & 1;
+    *c = saved;
+    return found;
+}
+
+static int oot_gamedata_string(Ctx *c, uint32_t hash, char *buf, size_t size) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    A64Fn get = a64_lookup(0x80cd0ea0ULL);
+    buf[0] = 0;
+    if (!mgr || !get) return 0;
+    const Ctx saved = *c;
+    const uint64_t out = (c->x[31] - 0x40) & ~0xfULL;
+    recomp_store64_sp(c, out, 0);
+    c->x[31] = out;
+    c->x[0] = mgr, c->x[1] = out, c->x[2] = hash;
+    get(c);
+    const int found = (int)(c->x[0] & 1);
+    const uint64_t text = recomp_load64(c, out);
+    *c = saved;
+    if (!found || !text) return 0;
+    for (size_t i = 0; i + 1 < size; i++) {
+        buf[i] = (char)recomp_load8(c, text + i);
+        buf[i + 1] = 0;
+        if (!buf[i]) break;
+    }
+    return 1;
+}
+
+/* One argument of an EventRequestArg: the array of 200-byte entries at arg+8, capacity arg+0, count arg+16.
+   Entry: +0 type (1 string pointer, 4 bool), +8 name buffer, +16 its capacity, +152 the value. As
+   QueryBancChangeEventRequestArg (f_829df380) fills them. A string value is a pointer the request does not copy. */
+static int oot_event_arg(Ctx *c, uint64_t arg, const char *name, uint32_t type, uint64_t value) {
+    const uint32_t capacity = recomp_load32(c, arg), count = recomp_load32(c, arg + 16);
+    if (count >= capacity) return 0;
+    const uint64_t entry = recomp_load64(c, arg + 8) + (uint64_t)count * 200;
+    const uint64_t name_buf = recomp_load64(c, entry + 8);
+    const uint32_t name_cap = recomp_load32(c, entry + 16);
+    const size_t length = strlen(name);
+    if (!name_buf || length + 1 > name_cap) return 0;
+    memcpy(A64_PTR(name_buf), name, length + 1);
+    if (type == 4) recomp_store8(c, entry + 152, value & 1);
+    else recomp_store64(c, entry + 152, value);
+    recomp_store32(c, entry, type);
+    recomp_store32(c, arg + 16, count + 1);
+    return 1;
+}
+
+static struct {
+    int64_t requested_at, check_at;
+    unsigned destination;
+} teleport;
+
+static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
+    if (index >= sizeof oot_destinations / sizeof oot_destinations[0]) return 0;
+    const int64_t now = hos_now_ns();
+    if (teleport.requested_at && now - teleport.requested_at < 8000000000LL) {
+        hos_log("cheats: teleport ignored, a request is still in progress");
+        return 0;
+    }
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    A64Fn make_arg = a64_lookup(0x80d99f10ULL), request = a64_lookup(0x80d9a820ULL);
+    A64Fn set_link = a64_lookup(0x802dc440ULL), release_link = a64_lookup(0x8022b6f0ULL);
+    if (!events || !make_arg || !request || !set_link || !release_link) {
+        hos_log("cheats: teleport unavailable (event manager %#llx)", (unsigned long long)events);
+        return 0;
+    }
+    if (recomp_load64(c, events + 104)) {   /* (the Main sequence's "Event" test: an event is playing) */
+        hos_log("cheats: teleport waits until the current event ends");
+        return 0;
+    }
+    int loading = 0, child = 1;
+    if (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading) {   /* Sequence_IsLoadingBanc */
+        hos_log("cheats: teleport ignored while a map loads");
+        return 0;
+    }
+    if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) hos_log("cheats: Sequence_IsChildhood not found, using child maps");
+    const OotDestination *d = &oot_destinations[index];
+    const char *banc = child ? d->child_banc : d->adult_banc;
+    const char *start = child ? d->child_start : d->adult_start;
+    const char *boot = child ? d->child_boot : d->adult_boot;
+    if (!banc) {
+        hos_log("cheats: teleport %u has no %s map", index, child ? "child" : "adult");
+        return 0;
+    }
+
+    /* The event reads its string arguments after this request returns, so they live in memory that stays. */
+    static uint64_t strings;
+    if (!strings) strings = hos_sys_alloc(512, 16);
+    if (!strings) return 0;
+    memset(A64_PTR(strings), 0, 512);
+    memcpy(A64_PTR(strings), banc, strlen(banc) + 1);
+    memcpy(A64_PTR(strings + 128), start, strlen(start) + 1);
+    memcpy(A64_PTR(strings + 256), boot, strlen(boot) + 1);
+
+    const char *event_env = getenv("HOS_OOT_TELEPORT_EVENT");
+    const char *event = event_env && *event_env ? event_env : "Dm_SY_BancChangeGo";
+    const char *starter_env = getenv("HOS_OOT_TELEPORT_STARTER");
+    const int with_starter = !(starter_env && !strcmp(starter_env, "0"));
+
+    const Ctx saved = *c;
+    const uint64_t arg = (c->x[31] - OOT_EVENT_ARG_SIZE - 0x100) & ~0xfULL;
+    c->x[31] = arg;
+    c->x[0] = arg;
+    make_arg(c);
+    int ok = 1;
+    {   /* the event's name: arg+6800 points at its buffer, arg+6808 the capacity */
+        const uint64_t buf = recomp_load64(c, arg + 6800);
+        const uint32_t cap = recomp_load32(c, arg + 6808);
+        if (!buf || strlen(event) + 1 > cap) ok = 0;
+        else memcpy(A64_PTR(buf), event, strlen(event) + 1);
+    }
+    ok = ok && oot_event_arg(c, arg, "NextBanc", 1, strings);
+    ok = ok && oot_event_arg(c, arg, "NextStartPos", 1, strings + 128);
+    ok = ok && oot_event_arg(c, arg, "BootEventName", 1, strings + 256);
+    ok = ok && oot_event_arg(c, arg, "IsCheckAir", 4, 0);
+    if (ok && with_starter) {   /* the starter actor (arg+0x1950), as OneShotEventMemberRequestEventByEventName sets it */
+        c->x[31] = arg;
+        c->x[0] = arg + 0x1950, c->x[1] = actor, c->x[2] = 0;
+        set_link(c);
+    }
+    uint64_t result = 0;
+    if (ok) {
+        c->x[31] = arg;
+        c->x[0] = events, c->x[1] = arg;
+        request(c);
+        result = c->x[0];
+    }
+    /* SeqOneShotRequestEvent's cleanup of the arg's two actor links */
+    for (unsigned i = 0; i < 2; i++) {
+        const uint64_t link = arg + (i ? 0x1950 : 0x1968);
+        recomp_store64(c, link, 0x84994b20ULL);
+        c->x[31] = arg;
+        c->x[0] = link;
+        release_link(c);
+    }
+    *c = saved;
+    teleport.requested_at = now;
+    teleport.check_at = now + 1500000000LL;
+    teleport.destination = index;
+    hos_log("cheats: teleport %s to %s at %s (boot %s, event %s, starter %d): request %s, result %#llx",
+            child ? "child" : "adult", banc, start, boot, event, with_starter, ok ? "sent" : "not built",
+            (unsigned long long)result);
+    return ok;   /* (sent; the request's own result is only logged) */
+}
+
+/* Writes a GameData bool directly: GameDataMgr+32 is the (hash, index) table (+44 its size), the bools are 24-byte
+   entries at GameDataMgr+24 (+16 their count) with the value at +22, as f_8022d9c0 reads them. 1 when found. */
+static int oot_gamedata_set_bool(Ctx *c, uint32_t hash, int value) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    if (!mgr) return 0;
+    const uint64_t table = recomp_load64(c, mgr + 32);
+    const uint32_t size = recomp_load32(c, mgr + 44);
+    if (!table || !size) return 0;
+    for (uint32_t probe = 0, slot = hash % size; probe < size; probe++, slot = (slot + 1) % size) {
+        const uint32_t key = recomp_load32(c, table + slot * 8ULL);
+        if (!key) return 0;
+        if (key != hash) continue;
+        const uint32_t index = recomp_load32(c, table + slot * 8ULL + 4), count = recomp_load32(c, mgr + 16);
+        if (index >= count) return 0;
+        recomp_store8(c, recomp_load64(c, mgr + 24) + index * 24ULL + 22, value ? 1 : 0);
+        return 1;
+    }
+    return 0;
+}
+
+/* Age toggle: flips Sequence_IsChildhood (what the Temple of Time event sets) and reloads the current map, or the
+   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. */
+static void oot_toggle_age(Ctx *c, uint64_t actor) {
+    int child = 1;
+    if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) {
+        hos_log("cheats: age toggle: Sequence_IsChildhood not found");
+        return;
+    }
+    char current[80];
+    oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
+    unsigned target = 3;   /* Market (the Temple of Time is in it) */
+    for (unsigned i = 0; i < sizeof oot_destinations / sizeof oot_destinations[0]; i++) {
+        const OotDestination *d = &oot_destinations[i];
+        const char *other = child ? d->adult_banc : d->child_banc;
+        if (other && ((d->child_banc && !strcmp(d->child_banc, current)) || (d->adult_banc && !strcmp(d->adult_banc, current)))) {
+            target = i;
+            break;
+        }
+    }
+    if (!oot_gamedata_set_bool(c, 0xcea220d3u, !child)) {
+        hos_log("cheats: age toggle: could not write Sequence_IsChildhood");
+        return;
+    }
+    hos_log("cheats: age toggle: %s -> %s, reloading via destination %u (current map \"%s\")",
+            child ? "child" : "adult", child ? "adult" : "child", target, current);
+    if (!oot_teleport(c, actor, target)) {
+        oot_gamedata_set_bool(c, 0xcea220d3u, child);
+        hos_log("cheats: age toggle undone, the map change was not requested");
+    }
+}
+
+static void oot_teleport_followup(Ctx *c) {
+    if (!teleport.check_at || hos_now_ns() < teleport.check_at) return;
+    teleport.check_at = 0;
+    char next[80], current[80];
+    oot_gamedata_string(c, 0xee27bf71u, next, sizeof next);     /* Sequence_ReservedNextBanc */
+    oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    hos_log("cheats: teleport check: reserved \"%s\", current \"%s\", event playing %d", next, current,
+            events && recomp_load64(c, events + 104) ? 1 : 0);
+}
+
+static uint64_t oot_gameplay_view(Ctx *c) {
+    const uint64_t singleton = recomp_load64(c, 0x84ca6bc0ULL);
+    const uint64_t manager = singleton ? recomp_load64(c, singleton) : 0;
+    const uint64_t cameras = manager && recomp_load32(c, manager + 32) ? recomp_load64(c, manager + 40) : 0;
+    const uint64_t camera = cameras ? recomp_load64(c, cameras) : 0;
+    return camera ? recomp_load64(c, camera + 120) : 0;
+}
+
+static float oot_load_float(Ctx *c, uint64_t addr) {
+    const uint32_t bits = recomp_load32(c, addr);
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static _Thread_local uint64_t flight_transform_controller;
+static _Thread_local uint64_t flight_pose_actor;
+static _Thread_local float flight_transform_yaw;
+static int64_t flight_player_seen;
+
+static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
+    int rx_option(int id, int otherwise);
+    static uint64_t flying_actor, marked_actor, marked_controller;
+    static int64_t last_tick, last_player_tick;
+    static float target[3], velocity[3], mark[3], yaw;
+    const int flying = rx_option(HOS_OPT_CHEAT_FLIGHT, 0) > 0;
+    if (!flying) flying_actor = 0;
+    const int64_t now = hos_now_ns();
+    __atomic_store_n(&flight_player_seen, now, __ATOMIC_RELAXED);
+    if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
+    last_player_tick = now;
+    int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
+    if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
+    oot_teleport_followup(c);
+    oot_inventory_refresh(c, now);
+    if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
+        oot_inventory_edit(c, action);
+    } else if (action == OOT_AGE_ACTION) {
+        oot_toggle_age(c, actor);
+    } else if (action >= OOT_TELEPORT_ACTION) {
+        oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
+    } else if (action >= 200) {
+        oot_edit_pouch(c, action);
+    } else if (action >= 100 && action < 124) {
+        oot_set_time(c, action - 100);
+    }
+    if (!flying && action != 2 && action != 3) return;
+
+    // Follow OneShotPhysicsCctChangePosition to Link's controller.
+    const unsigned offsets[] = {80, 32, 16, 8};
+    uint64_t controller = components;
+    for (unsigned i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
+        controller = recomp_load64(c, controller + offsets[i]);
+        if (!controller) return;
+    }
+    const uint64_t vtable = recomp_load64(c, controller);
+    if (vtable != 0x84c54f10ULL || recomp_load64(c, vtable + 0xe8) != 0x806d2530ULL) return;
+    A64Fn change_position = a64_lookup(0x806d2530ULL);
+    if (!change_position) return;
+
+    if (action == 2) {
+        for (unsigned i = 0; i < 3; i++) {
+            const uint32_t bits = recomp_load32(c, actor + 796 + i * 4);
+            memcpy(&mark[i], &bits, sizeof bits);
+        }
+        marked_actor = actor;
+        marked_controller = controller;
+        hos_log("cheats: marked position %.2f %.2f %.2f", mark[0], mark[1], mark[2]);
+    }
+    const int returning = action == 3 && marked_controller == controller;
+    if (action == 3 && !returning) hos_log("cheats: no mark for this player controller");
+    if (!flying && !returning) return;
+    const int64_t elapsed = now - last_tick;
+    if (flying_actor != actor)
+        yaw = atan2f(oot_load_float(c, actor + 816), oot_load_float(c, actor + 840));
+    if (returning) {
+        memcpy(target, mark, sizeof target);
+        memset(velocity, 0, sizeof velocity);
+        flying_actor = flying ? actor : 0;
+    } else if (flying_actor != actor || elapsed < 0 || elapsed > 250000000) {
+        for (unsigned i = 0; i < 3; i++) target[i] = oot_load_float(c, actor + 796 + i * 4);
+        memset(velocity, 0, sizeof velocity);
+        flying_actor = actor;
+        last_tick = now;
+        return;
+    } else if (elapsed == 0) {
+        return;
+    }
+    last_tick = now;
+
+    DWORD foreground = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    if (!returning) {
+        const float dt = fminf((float)elapsed * 1e-9f, 0.05f);
+        float desired[3] = {0};
+        if (foreground == GetCurrentProcessId() && !rx_option(1, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) {
+            uint64_t hos_flight_input(void);
+            const uint64_t axes = hos_flight_input();
+            const float right = (int16_t)axes / 32767.0f, forward = (int16_t)(axes >> 16) / 32767.0f;
+            const int vertical = (GetAsyncKeyState(VK_PRIOR) < 0) - (GetAsyncKeyState(VK_NEXT) < 0);
+            const uint64_t view = oot_gameplay_view(c);
+            float rx = 1, rz = 0;
+            if (view && recomp_load64(c, view) == 0x84c18a88ULL) {
+                const float x = oot_load_float(c, view + 8), z = oot_load_float(c, view + 16);
+                const float length = hypotf(x, z);
+                if (length > 0.01f) rx = x / length, rz = z / length;
+            }
+            desired[0] = rx * right + rz * forward;
+            desired[1] = vertical ? vertical : (int16_t)(axes >> 32);
+            desired[2] = rz * right - rx * forward;
+        }
+        const float length = sqrtf(desired[0] * desired[0] + desired[1] * desired[1] + desired[2] * desired[2]);
+        const float speed = 4.0f / fmaxf(1.0f, length);
+        const float blend = 1.0f - expf(-12.0f * dt);
+        for (unsigned i = 0; i < 3; i++) {
+            velocity[i] += (desired[i] * speed - velocity[i]) * blend;
+            target[i] += velocity[i] * dt;
+        }
+        if (hypotf(desired[0], desired[2]) > 0.08f) {
+            const float delta = remainderf(atan2f(desired[0], desired[2]) - yaw, 6.28318531f);
+            yaw += fmaxf(-8.0f * dt, fminf(delta, 8.0f * dt));
+        }
+    }
+
+    const Ctx saved = *c;
+    const uint64_t arg = c->x[31] - 16;
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t bits;
+        memcpy(&bits, &target[i], sizeof bits);
+        recomp_store32_sp(c, arg + i * 4, bits);
+    }
+    recomp_store32_sp(c, arg + 12, 0);
+    c->x[31] = arg;
+    c->x[0] = controller;
+    c->x[1] = arg;
+    flight_transform_yaw = yaw;
+    flight_pose_actor = flying && !returning ? actor : 0;
+    flight_transform_controller = flying && !returning ? controller : 0;
+    change_position(c);
+    flight_transform_controller = 0;
+    *c = saved;
+    if (returning) hos_log("cheats: returned to %.2f %.2f %.2f", mark[0], mark[1], mark[2]);
+}
+#endif
+
+int hos_oot_flight_shortcut_ready(void) {
+#ifdef _WIN32
+    const int64_t seen = __atomic_load_n(&flight_player_seen, __ATOMIC_RELAXED);
+    return seen && hos_now_ns() - seen < 250000000;
+#else
+    return 0;
+#endif
+}
+
+#ifdef _WIN32
+static void oot_write_flight_rotation(Ctx *c, uint64_t matrix) {
+    const float s = sinf(flight_transform_yaw), co = cosf(flight_transform_yaw);
+    const float rotation[3][3] = {{co, 0, s}, {0, 1, 0}, {-s, 0, co}};
+    for (unsigned row = 0; row < 3; row++) {
+        for (unsigned col = 0; col < 3; col++) {
+            uint32_t bits;
+            memcpy(&bits, &rotation[row][col], sizeof bits);
+            recomp_store32(c, matrix + row * 16 + col * 4, bits);
+        }
+    }
+}
+#endif
+
+void hos_oot_flight_rotation(Ctx *c, uint64_t controller, uint64_t matrix) {
+#ifdef _WIN32
+    if (flight_transform_controller == controller) oot_write_flight_rotation(c, matrix);
+#else
+    (void)c;
+    (void)controller;
+    (void)matrix;
+#endif
+}
+
+void hos_oot_flight_pose(Ctx *c, uint64_t actor, uint64_t matrix) {
+#ifdef _WIN32
+    if (flight_pose_actor == actor) {
+        flight_pose_actor = 0;
+        oot_write_flight_rotation(c, matrix);
+    }
+#else
+    (void)c;
+    (void)actor;
+    (void)matrix;
+#endif
+}
+
+void hos_oot_lift_player(Ctx *c, uint64_t actor) {
+#ifdef _WIN32
+    flight_pose_actor = 0;
+    if (recomp_load64(c, actor) != 0x84b45e18ULL) return;
+    const uint64_t components = recomp_load64(c, actor + 624);
+    const uint64_t movement = components ? recomp_load64(c, components + 800) : 0;
+    if (movement < HOS_HEAP_BASE + 0x1d50 || recomp_load64(c, movement + 24) != actor ||
+        !hos_oot_is_player(c, movement - 0x1d50)) return;
+
+    // Link can be updated by different guest workers on successive frames.
+    static SRWLOCK cheats_lock = SRWLOCK_INIT;
+    if (!TryAcquireSRWLockExclusive(&cheats_lock)) return;
+    oot_update_player_cheats(c, actor, components);
+    ReleaseSRWLockExclusive(&cheats_lock);
+#else
+    (void)c;
+    (void)actor;
+#endif
+}
+
+#ifdef _WIN32
+static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
+    int rx_option(int id, int otherwise);
+    static uint64_t active_view;
+    static int64_t last_tick;
+    static double eye[3], yaw, pitch;
+    const int64_t now = hos_now_ns();
+    const int64_t elapsed = now - last_tick;
+
+    if (!view) {
+        active_view = 0;
+        return;
+    }
+    if (active_view != view || elapsed > 500000000) {
+        double target[3];
+        memcpy(eye, A64_PTR(view + 96), sizeof eye);
+        memcpy(target, A64_PTR(view + 120), sizeof target);
+        const double x = eye[0] - target[0], y = eye[1] - target[1], z = eye[2] - target[2];
+        yaw = atan2(x, z);
+        pitch = atan2(y, hypot(x, z));
+        active_view = view;
+        hos_log("cheats: free camera at %.2f %.2f %.2f", eye[0], eye[1], eye[2]);
+    }
+    last_tick = now;
+    DWORD foreground = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    const double dt = elapsed > 0 && elapsed < 100000000 ? (double)elapsed * 1e-9 : 0;
+    const int control = foreground == GetCurrentProcessId() && !rx_option(1, 0);
+    int height = 0;
+    uint64_t hos_free_camera_input(int *height);
+    const uint64_t input = control ? hos_free_camera_input(&height) : 0;
+    if (control) {
+        yaw -= 1.6 * dt * (int16_t)(input >> 32) / 32767.0;
+        pitch -= 1.2 * dt * (int16_t)(input >> 48) / 32767.0;
+        pitch = fmax(-1.55, fmin(1.55, pitch));
+    }
+    const double sy = sin(yaw), cy = cos(yaw), sp = sin(pitch), cp = cos(pitch);
+    const double axes[3][3] = {{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}};
+    if (control) {
+        const double step = dt * (GetAsyncKeyState(VK_CONTROL) < 0 ? 30.0 : 8.0);
+        const double right = (int16_t)input / 32767.0;
+        const double forward = (int16_t)(input >> 16) / 32767.0;
+        const int key_height = (GetAsyncKeyState(VK_PRIOR) < 0) - (GetAsyncKeyState(VK_NEXT) < 0);
+        eye[1] += step * (key_height ? key_height : height);
+        for (int i = 0; i < 3; i++)
+            eye[i] += step * (right * axes[0][i] - forward * axes[2][i]);
+    }
+    for (int row = 0; row < 3; row++) {
+        const double *axis = axes[row];
+        const float values[4] = {(float)axis[0], (float)axis[1], (float)axis[2],
+            (float)-(axis[0] * eye[0] + axis[1] * eye[1] + axis[2] * eye[2])};
+        for (int col = 0; col < 4; col++) {
+            uint32_t bits;
+            memcpy(&bits, &values[col], sizeof bits);
+            recomp_store32(c, out + (row * 4 + col) * 4, bits);
+        }
+    }
+}
+#endif
+
+void hos_oot_free_view(Ctx *c, uint64_t view) {
+#ifdef _WIN32
+    int rx_option(int id, int otherwise);
+    if (!view || recomp_load64(c, view) != 0x84c18a88ULL) return;
+
+    // Camera zero supplies the gameplay view. The same matrix routine also serves other cameras.
+    if (oot_gameplay_view(c) != view) return;
+
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    const int enabled = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+    oot_build_free_view(c, enabled ? view : 0, view + 8);
+    ReleaseSRWLockExclusive(&lock);
+#else
+    (void)c;
+    (void)view;
+#endif
+}
+
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
+/* (nx2/oot_native_resolution.py) mode 1's scene base scale 1.0 instead of 0.8: Resolution 100% (host/nn_vi.c keeps it current),
+   HOS_SCENE_NATIVE=0/1 over it */
+volatile int hos_native_scene;
+volatile int hos_fix_res;   /* (nx2/oot_native_resolution.py's cached-scale refresh: HOS_FIX_RES=1; #849's fixed-scale patch does it by default) */
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
 /* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
 volatile int hos_occlusion_off;
@@ -316,15 +1172,47 @@ static void occlusion_switch(void) {
 __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
+/* (hookshot) The game's paths are UTF-8 char strings through Windows' A functions and fopen: its manifest (nx2/win_manifest.py)
+   makes the process's code page UTF-8, from Windows 10 1903 on. Before that, or with the manifest missing, those take the system's
+   ANSI code page, and a folder name it cannot spell (Japanese on a Western Windows, an emoji) comes back as "?": nothing opens and
+   the game closed with no window and no log. The exe's own path through GetModuleFileNameA must name the exe (a name past MAX_PATH
+   bytes fails the same way); when it does not, a message says why (none for the builder's --prepare-shaders run: its log has it). */
+static int narrow_paths_ok(int argc, char **argv) {
+    char a[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(NULL, a, MAX_PATH);
+    if (n && n < MAX_PATH && GetFileAttributesA(a) != INVALID_FILE_ATTRIBUTES) return 1;
+    wchar_t w[MAX_PATH * 2] = L"";
+    GetModuleFileNameW(NULL, w, MAX_PATH * 2);
+    fprintf(stderr, "hookshot: this folder's path cannot be opened (code page %u, %s): move the game to a folder with a plain name\n",
+            GetACP(), n >= MAX_PATH ? "too long" : "has characters the code page lacks");
+    int quiet = getenv("HOS_HEADLESS") != NULL;
+    for (int i = 1; i < argc; i++) quiet |= !strcmp(argv[i], "--prepare-shaders");
+    if (!quiet) {
+        wchar_t text[MAX_PATH * 2 + 640];
+        _snwprintf(text, sizeof text / sizeof text[0],
+                   L"Hookshot can't open its files in this folder:\n\n%ls\n\n"
+                   L"%ls\n\nMove the game folder somewhere with a shorter name of plain letters and digits (for example C:\\Games\\Hookshot), "
+                   L"or update Windows.",
+                   w, GetACP() == CP_UTF8 ? L"The path is too long."
+                                          : L"Its name has characters this Windows can only give the game from Windows 10 version 1903 on.");
+        text[sizeof text / sizeof text[0] - 1] = 0;
+        MessageBoxW(NULL, text, L"Hookshot", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #else
 static int game_main(int argc, char **argv) {
 #endif
 #ifdef _WIN32
+    if (!narrow_paths_ok(argc, argv)) return 1;
     load_hookshot_env();
 #endif
     occlusion_switch();
 #ifdef _WIN32
+    const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
+    hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
     {   // (the whole process, not only the window's thread: the renderer asks the window's size from its own, and on a 4K screen at 150%
         // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. Hookshot issues 15, 18, 20)
         typedef BOOL(WINAPI * SetAware)(void *);
@@ -333,6 +1221,18 @@ static int game_main(int argc, char **argv) {
     }
 #endif
     {   // (started from its icon the game has nowhere to log to: hookshot_log.txt beside it, last run only, for players to send in)
+#ifdef _WIN32
+        {   /* (started again by the Insert menu's Restart now (host/hos_relaunch.c): the run before still has its log open until
+               it exits, so wait for it (up to 10 s) before the log moves to .1, or the move fails and its log is overwritten) */
+            const char *of = getenv("HOS_RESTART_OF");
+            if (of && *of) {
+                HANDLE before = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)strtoul(of, NULL, 10));
+                if (before) WaitForSingleObject(before, 10000), CloseHandle(before);
+                SetEnvironmentVariableA("HOS_RESTART_OF", NULL);   /* (not passed on: a later restart sets its own) */
+                _putenv("HOS_RESTART_OF=");
+            }
+        }
+#endif
         HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
         if (!err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
             char path[MAX_PATH + 32];
@@ -397,7 +1297,8 @@ static int game_main(int argc, char **argv) {
         }
     }
     if (!image) {
-        fprintf(stderr, "usage: %s image.bin --romfs <dir> --user <dir> [--trace]\n", argv[0]);
+        fprintf(stderr, "usage: %s [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]\n",
+                argv[0]);
         return 2;
     }
     if (getenv("HOS_TRACE")) hos_trace = 1;
@@ -454,21 +1355,62 @@ static int game_main(int argc, char **argv) {
                 FILE *o = fopen(path, "r");
                 if (o) {
                     char line[80];
-                    while (fgets(line, sizeof line, o))
+                    while (fgets(line, sizeof line, o)) {
                         if (!strncmp(line, "ultrawide=", 10)) on = atoi(line + 10) != 0;
+                        /* (the game sizes its scene before the menu is up: Resolution 100% read here too) */
+                        /* (resolution=1 no longer raises the scene: #849 makes a fixed Resolution reach the 3D; HOS_SCENE_NATIVE=1 below) */
+                    }
                     fclose(o);
                 }
             }
             const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
             if (on && sh > 0) want = (float)sw / (float)sh;
         }
+        if (getenv("HOS_SCENE_NATIVE")) hos_native_scene = atoi(getenv("HOS_SCENE_NATIVE")) != 0;
+        if (getenv("HOS_FIX_RES")) hos_fix_res = atoi(getenv("HOS_FIX_RES")) != 0;
+        if (hos_native_scene) hos_log("boot: HOS_SCENE_NATIVE=1: the scene's base scale 1.0 (the game's 0.8 otherwise)");
         extern volatile uint64_t hos_wide_out, hos_wide_scene;
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
         const double game = 16.0 / 9.0;
+        /* Deck profile: the picture is 1280x720 and the scene is 3/4 of it (960x540), the same ratio as the shipped
+           2560x1440 picture and 1920x1080 scene. A 16:9 picture leaves the camera, HUD and movie patches off (they run
+           only when the picture is wider than 16:9), so the 3840x2160 UI grid still fills the picture. RX_DECK_PICTURE=
+           <w>x<h> picks another picture; RX_DECK_PICTURE=0 keeps 2560x1440. Desktop is unchanged unless that variable
+           is set. Ultrawide on the Deck uses this height instead of 1440. */
+        const char *pic = getenv("RX_DECK_PICTURE");
+        const char *deck = getenv("RX_VK_DECK");
+        const int deck_on = deck && deck[0] != '0';
+        const int old_size = pic && pic[0] == '0' && pic[1] == '\0';
+        unsigned deck_w = 1280, deck_h = 720;
+        int deck_picture = 0;
+        if (!old_size && pic && pic[0]) {
+            if (sscanf(pic, "%ux%u", &deck_w, &deck_h) == 2 && deck_w >= 64 && deck_h >= 64)
+                deck_picture = 1;
+            else
+                hos_log("boot: RX_DECK_PICTURE=%s is not 0 or WIDTHxHEIGHT: the shipped picture", pic);
+        } else if (!old_size && deck_on)
+            deck_picture = 1;
+        if (deck_picture) {
+            deck_w = (deck_w + 4u) / 8u * 8u;
+            deck_h = (deck_h + 4u) / 8u * 8u;
+        }
+        setenv("RX_DECK_PICTURE_ON", deck_picture ? "1" : "0", 1);
         if (want > game * 1.01) {
             double r = want > 32.0 / 9.0 ? 32.0 / 9.0 : want;
-            const unsigned oh = 1440, ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
-            const unsigned sh = 1080, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
+            uint32_t hos_output_size(int height);   /* (host/nn_applet.c: the Output resolution's height, 1440 as shipped) */
+            unsigned oh = deck_picture ? deck_h : hos_output_size(1);
+            unsigned ow = deck_picture ? (unsigned)(oh * r / 8 + 0.5) * 8u : (unsigned)(oh * r / 8 + 0.5) * 8;
+            /* (at most 3840 x 2160's pixels, the shape kept: the game's render targets come from a pool sized for its picture
+               (host/nn_applet.c hos_rt_pool_size), and a 32:9 screen at the 4K output made a 7680 x 2160 one. Its pool at the
+               output's size ran out as Kokiri Forest loaded (a null pointer, issue 1031); a pool for the whole picture, 1.4 GB,
+               failed the game's own reservation at boot. 5400 x 1520 there, more than the 5120 x 1440 screens it was seen on) */
+            if (!deck_picture && (double)ow * oh > 3840.0 * 2160.0) {
+                oh = (unsigned)(sqrt(3840.0 * 2160.0 / r) / 8) * 8;
+                ow = (unsigned)(oh * r / 8) * 8;
+            }
+            const unsigned sh = deck_picture ? (oh * 3u / 4u + 4u) / 8u * 8u : oh * 3 / 4;
+            const unsigned sw =
+                deck_picture ? (ow * 3u / 4u + 4u) / 8u * 8u : (unsigned)(ow * 0.75 / 8 + 0.5) * 8;
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;
             hos_wide_ratio = (float)ow / (float)oh;
@@ -477,6 +1419,12 @@ static int game_main(int argc, char **argv) {
             hos_aspect_ratio = hos_wide_ratio;
             hos_log("boot: widescreen: picture %ux%u, scene %ux%u, camera ratio %.4f, HUD and movies in the middle %.1f%%", ow, oh, sw, sh,
                     (double)hos_wide_ratio, hos_wide_squeeze * 100.0);
+        } else if (deck_picture) {
+            const unsigned ow = deck_w, oh = deck_h, sw = ow * 3u / 4u, sh = oh * 3u / 4u;
+            hos_wide_out = (uint64_t)oh << 32 | ow;
+            hos_wide_scene = (uint64_t)sh << 32 | sw;
+            hos_log("boot: deck picture %ux%u, scene %ux%u (3/4 of the picture). RX_DECK_PICTURE=0 keeps 2560x1440 and 1920x1080",
+                    ow, oh, sw, sh);
         } else if (want > 1.0f) {
             hos_log("boot: widescreen: a %.4f screen is not wider than 16:9: the game's own picture", (double)want);
         }
@@ -520,6 +1468,115 @@ static int game_main(int argc, char **argv) {
 }
 
 #ifndef _WIN32
+/* Steam Deck (LCD Jupiter, OLED Galileo) and any Van Gogh (PCI 1002:163f). Before the game reads the environment:
+   no occlusion queries, no frame generation, a 45 fps present cap (90 Hz / 2). RX_VK_DECK=0 skips this. A value
+   already in the environment or hookshot_env.txt is left as it is. */
+static int valve_deck(void) {
+    const char *e = getenv("RX_VK_DECK");
+    if (e) return e[0] != '0';
+    FILE *f = fopen("/sys/class/dmi/id/product_name", "r");
+    char name[64];
+    if (f) {
+        if (fgets(name, sizeof name, f) &&
+            (strstr(name, "Galileo") || strstr(name, "Jupiter") || strstr(name, "Steam Deck"))) {
+            fclose(f);
+            return 1;
+        }
+        fclose(f);
+    }
+    DIR *d = opendir("/sys/bus/pci/devices");
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        char path[320];
+        unsigned vendor = 0, device = 0;
+        if (ent->d_name[0] == '.') continue;
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/vendor", ent->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%x", &vendor) != 1) vendor = 0;
+        fclose(f);
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/device", ent->d_name);
+        f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%x", &device) != 1) device = 0;
+            fclose(f);
+        }
+        if (vendor == 0x1002 && device == 0x163f) {
+            closedir(d);
+            return 1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+/* handheld_profile= in either options file (the folder, or bin/ beside the exe). -1: not set. */
+static int deck_ini_handheld(char *found, size_t nfound) {
+    char path[MAX_PATH], folded[MAX_PATH], raw[MAX_PATH];
+    const char *cands[2];
+    int nc = 0;
+    DWORD n = hos_game_path_a(path, MAX_PATH);
+    char *slash = n ? (strrchr(path, '/') ? strrchr(path, '/') : strrchr(path, '\\')) : NULL;
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        snprintf(folded, sizeof folded, "%s", path);
+        cands[nc++] = folded;
+    }
+    n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    slash = n && n < MAX_PATH ? (strrchr(path, '/') ? strrchr(path, '/') : strrchr(path, '\\')) : NULL;
+    if (slash) {
+        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        if (!nc || strcmp(cands[0], path) != 0) {
+            snprintf(raw, sizeof raw, "%s", path);
+            cands[nc++] = raw;
+        }
+    }
+    for (int i = 0; i < nc; i++) {
+        FILE *f = fopen(cands[i], "r");
+        if (!f) continue;
+        char line[96];
+        int v = -1;
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
+        fclose(f);
+        if (v >= 0) {
+            if (found && nfound) snprintf(found, nfound, "%s", cands[i]);
+            return v;
+        }
+    }
+    if (found && nfound) found[0] = 0;
+    return -1;
+}
+static void deck_profile(void) {
+    if (!valve_deck()) return;
+    if (!getenv("HOOKSHOT_OCCLUSION_OFF")) setenv("HOOKSHOT_OCCLUSION_OFF", "1", 0);
+    if (!getenv("RX_VK_FRAMEGEN")) setenv("RX_VK_FRAMEGEN", "0", 0);
+    if (!getenv("RX_VK_FPS_CAP")) setenv("RX_VK_FPS_CAP", "45", 0);
+    if (!getenv("RX_VK_DECK")) setenv("RX_VK_DECK", "1", 0);
+    if (!(getenv("RX_VK_DECK") && getenv("RX_VK_DECK")[0] == '0')) {
+        char ini_path[MAX_PATH] = "";
+        const int ini = deck_ini_handheld(ini_path, sizeof ini_path);
+        if (getenv("HOS_HANDHELD"))
+            fprintf(stderr, "hookshot: handheld left as HOS_HANDHELD=%s (ini handheld_profile=%s%s)\n",
+                    getenv("HOS_HANDHELD"), ini < 0 ? "unset" : ini ? "1" : "0", ini_path);
+        else if (ini == 0) {
+            setenv("HOS_HANDHELD", "0", 0);
+            fprintf(stderr, "hookshot: handheld off (handheld_profile=0 in %s)\n", ini_path);
+        } else {
+            setenv("HOS_HANDHELD", "1", 0);
+            fprintf(stderr, "hookshot: handheld on (HOS_HANDHELD=1%s%s)\n",
+                    ini == 1 ? ", ini handheld_profile=1 " : ", no handheld_profile, Deck default ",
+                    ini == 1 ? ini_path : "");
+        }
+    }
+    fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap, "
+                    "game told the Switch 2 heap of 9809 MB, low-memory texture and staging limits, "
+                    "internal picture 1280x720). "
+                    "RX_VK_DECK=0 turns the profile off. RX_DECK_PICTURE=0 keeps the 2560x1440 picture. "
+                    "RX_VK_LOW_MEM=0 turns the memory limits off. "
+                    "RX_VK_LOW_HEAP=1 tells the game 4608 MB, which leaves a pointer null at the first submit. "
+                    "HOS_MEMORY_MB overrides the heap.\n");
+}
 /* (linux) The window belongs on the process's main thread (SDL), so the game runs on a thread of its own, with the
    stack the guest main thread's lifted code needs (the main thread has the system's 8 MB): host/posix/display_sdl.c */
 static int game_argc;
@@ -532,6 +1589,7 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+    deck_profile();
     game_argc = argc, game_argv = argv;
     const int window = hos_display_init();
     HANDLE t = CreateThread(NULL, 64u << 20, game_thread, NULL, 0, NULL);

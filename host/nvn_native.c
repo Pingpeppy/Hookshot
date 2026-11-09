@@ -202,8 +202,10 @@ NV(nvnDeviceGetImageHandle) { RET((uint64_t)I(1)); }
 /* combined handle = texture id (20 bits) | sampler id << 20: the Maxwell layout, which the shaders' handle reads expect */
 NV(nvnDeviceGetTextureHandle) {
     const int t = I(1), s = I(2);
-    if (t < 0 || t >= (1 << 20) || s < 0 || s >= (1 << 12)) die("texture handle ids %d/%d", t, s);
-    RET((uint64_t)t | (uint64_t)s << 20);
+    /* The SDK sign-extends both ids before combining them, and texture 0 always means no handle.
+       A missing texture can have id -1 (Castle Town's guard house): it stays the all-ones sentinel,
+       rather than stopping the game here. Keep the signed ids, including their upper bits. */
+    RET(t ? (uint64_t)t | (uint64_t)s << 20 : 0);
 }
 NV(nvnDeviceGetTexelFetchHandle) { RET((uint64_t)I(1)); }
 NV(nvnDeviceGetSeparateTextureHandle) { RET((uint64_t)I(1)); }
@@ -524,7 +526,8 @@ NV(nvnTextureBuilderSetSize2D) {
         static volatile LONG left = 24;
         if (on < 0) on = getenv("HOS_SIZE_TRACE") != NULL;
         const uint32_t w = U32(1);
-        if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920) && InterlockedDecrement(&left) >= 0) {
+        if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920 || w == 1280 || w == 960) &&
+            InterlockedDecrement(&left) >= 0) {
             void hos_backtrace(void);
             hos_log("nvn: texture size %ux%u (lr %#llx)", w, U32(2), (unsigned long long)c->x[30]);
             hos_backtrace();
@@ -1269,6 +1272,7 @@ static unsigned rec_shift = 16;   /* (set when the buckets are made) */
 static unsigned rec_bucket(uint64_t ctl) { return (unsigned)(((ctl >> rec_shift) * 0x9E3779B97F4A7C15ull) >> 48) & (REC_BUCKETS - 1); }
 static SRWLOCK copy_lock = SRWLOCK_INIT;
 static volatile LONG64 copy_bytes;
+uint64_t rx_nvn_copy_bytes(void) { return (uint64_t)copy_bytes; }
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
 typedef struct { uint64_t magic, bytes, cls; } copy_prefix;   /* (cls: its pool class) */
 /* released copies wait until the replay passed every submit made before their release (the replay runs behind) */
@@ -2189,7 +2193,15 @@ NV(nvnQueueSubmitCommands) {
         resolve_deferred((uint8_t *)(uintptr_t)h[i]);
     }
     held_init();
-    if (!hold_on) { rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q); return; }
+    if (!hold_on) {
+        /* (the replay runs here, on this thread, for ~9 ms a frame (vk_replay.cpp submit_q, RX_VK_ASYNC off): the virtual
+           core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
+           Nothing in the replay runs guest code or needs the core) */
+        const int away = hos_vcore_away();
+        rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
+        if (away) hos_vcore_back();
+        return;
+    }
     EnterCriticalSection(&held_cs);
     if (nheld == (LONG)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
         for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);

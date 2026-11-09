@@ -27,7 +27,8 @@
     X(vkGetPhysicalDeviceQueueFamilyProperties)                                                                       \
     X(vkGetPhysicalDeviceMemoryProperties)                                                                            \
     X(vkGetPhysicalDeviceFormatProperties)                                                                            \
-    X(vkGetPhysicalDeviceImageFormatProperties)                                                                            \
+    X(vkGetPhysicalDeviceImageFormatProperties)                                                                       \
+    X(vkGetPhysicalDeviceImageFormatProperties2)                                                                    \
     X(vkGetPhysicalDeviceSparseImageFormatProperties)                                                                 \
     X(vkEnumerateDeviceExtensionProperties)                                                                           \
     X(vkCreateDevice)                                                                                                 \
@@ -86,8 +87,10 @@
     X(vkBindImageMemory)                                                                                              \
     X(vkGetBufferMemoryRequirements)                                                                                  \
     X(vkGetImageMemoryRequirements)                                                                                   \
+    X(vkGetDeviceImageMemoryRequirements)                                                                             \
     X(vkGetImageSparseMemoryRequirements)                                                                             \
     X(vkGetMemoryHostPointerPropertiesEXT)                                                                            \
+    X(vkGetMemoryFdPropertiesKHR)                                                                                     \
     X(vkGetBufferDeviceAddress)
 
 // shaders, pipelines, descriptors, draws
@@ -155,7 +158,7 @@
     X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) \
     X(vkResetQueryPool) \
     X(vkCmdSetDepthClipEnableEXT) X(vkCmdSetLogicOpEXT) X(vkCmdClearAttachments) X(vkCmdSetDepthBoundsTestEnable) \
-    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT)
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkCmdWriteBufferMarkerAMD)
 
 namespace vkx {
 #define VKX_DECLARE(f) extern PFN_##f f;

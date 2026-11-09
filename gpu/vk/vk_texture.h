@@ -43,6 +43,7 @@ struct Texture {
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
     bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)
@@ -70,15 +71,27 @@ struct Texture {
     uint64_t upload_value = 0;   // (the submission its last upload was recorded in, and the parallel replay's segment
     uint64_t upload_seg = 0;     // that recorded it: one before it in the stream uploads it again)
     uint64_t last_frame = 0;  // the present it was last used in (the cache's age)
+    uint64_t last_ms = 0;     // when, for eviction: a slow device's presents are long (RufflezAU)
     uint64_t first_render_frame = 0;   // the present it was first rendered into in (0: never)
     uint64_t last_value = 0;  // the timeline value of the last submission that used it
-    uint64_t bytes = 0;       // device memory it holds
+    uint64_t bytes = 0;       // device memory it holds (the texels', or a sparse image's chunks)
+    uint64_t pad = 0;         // (what the allocator gave it beyond that: padding and alignment; counted in the budget with bytes)
     uint32_t id = 0;          // (its creation number: diagnostics tell images at one address apart)
     uint64_t first_seen = 0;  // (the present it was made at)
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
     std::unordered_map<uint64_t, VkImageView> views;
+    // (a BC image cannot be a colour attachment. When the game renders one block per texel of an uncompressed
+    // view, that view is this image and is copied back into the BC image at the end of the pass. RX_VK_BC_PROXY=0: off)
+    struct BlockProxy {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = nullptr;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        uint32_t width = 0, height = 0;
+    };
+    std::unordered_map<uint64_t, BlockProxy> block_proxy;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident
@@ -112,6 +125,17 @@ bool texture_marked(const Texture* tex);
 /// segment made are made again by an earlier one that needs them, as each segment's uploads precede it)
 void texture_set_segment(uint64_t seg);
 uint64_t texture_segment();
+/// A parallel replay's segments, in queue order: each one's init command buffer (begun; submitted right before its
+/// uploads). A new image's first layout change (UNDEFINED -> GENERAL, and its clear) that a segment's worker makes goes
+/// to the earliest segment's still being recorded, not to the maker's own uploads: a segment before the maker's that
+/// uses it is submitted first, and found it UNDEFINED (VUID-vkCmdDraw-None-09600 with RX_VK_PARALLEL only)
+void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n);
+/// This thread records segment `index` of them (-1: none, after it)
+void texture_segment_worker(int index);
+/// Segment `index` recorded: its init command buffer ended (no new image's change goes to it after). 1: something went
+/// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost: the
+/// replay stops)
+int texture_segment_end(int index);
 /// Changes with every submission (a texture touched in it is not checked again in it)
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)
@@ -140,6 +164,15 @@ void texture_gpu_wrote(uint64_t gpu, uint64_t size);
 void texture_watch_prog(uint64_t prog);
 /// A pass renders into it (first_render_frame)
 void texture_rendered(Texture* tex);
+/// A colour view of a BC image the game renders one block per texel. False when the formats are not the same size,
+/// or RX_VK_BC_PROXY=0. *view / *width / *height are the proxy's.
+bool texture_block_proxy(Texture* tex, uint32_t level, uint32_t layer, VkFormat view_format, VkImageView* view,
+                         uint32_t* width, uint32_t* height);
+bool texture_is_proxy_view(const Texture* tex, VkImageView view);
+void texture_block_proxy_copy(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer);
+/// A storage write into a block proxy: copied back after the pass or the dispatch, not while it is still bound
+void texture_proxy_note_store(Texture* tex);
+void texture_proxy_writeback(VkCommandBuffer cmd);
 /// The presents so far (the frame number textures are aged by)
 uint64_t texture_frame_no();
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
@@ -164,7 +197,10 @@ uint64_t texture_made();
 void texture_unswizzle_stats(int64_t* bytes, int64_t* ns);
 uint64_t texture_bytes();
 /// A full memory barrier (all commands, all accesses): what separates dependent work for now
-void full_barrier(VkCommandBuffer cmd);
+/// (why: its label in RX_VK_PASS_TIMING's barrier lines)
+void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
+/// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
+void barrier_stats(int64_t* made, int64_t* left_out);
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// RX_VK_DUMP_TEX: the textures uploaded next written to that folder as PPM (diagnostics)
 void texture_read_texels(const nvn_tex* t, unsigned level, unsigned layer0, const NVNcopyRegion* r, uint8_t* dst,
