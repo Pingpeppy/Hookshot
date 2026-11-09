@@ -15,22 +15,29 @@ def main():
 
     host = (ROOT / "host/nn_applet.c").read_text(encoding="utf-8")
     menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    posix = ROOT / "host" / "posix"
+    use_posix_win = (posix / "windows.h").is_file()
+    win_inc = '#include "windows.h"\n' if use_posix_win else "#include <windows.h>\n"
+    path_stub = (
+        "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
+        "DWORD GetModuleFileNameA(void *m, char *path, DWORD cap) {\n"
+        "    (void)m; return (DWORD)snprintf(path, cap, \"./hookshot.exe\"); }\n"
+        if use_posix_win
+        else "using DWORD = unsigned long;\nconstexpr int MAX_PATH = 260;\n"
+             "DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, \"./hookshot.exe\"); }\n"
+    )
     fixture = r'''
-#include <algorithm>
+''' + win_inc + path_stub + r'''#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
-
-using DWORD = unsigned long;
-constexpr int MAX_PATH = 260;
-DWORD hos_game_path_a(char *path, int size) { return snprintf(path, size, "./hookshot.exe"); }
 void hos_log(const char *, ...) {}
 volatile uint64_t hos_wide_out = 0;   // (host/hos_main.c: the widescreen picture, 0 = none; nn_applet.c reads it)
 struct { int handheld, output_res; } opts;
-''' + host[host.index("static int ini_option("):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
+''' + host[host.index("static int ini_option_at("):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
         menu.index("struct Out {"):menu.index("const char* tx_speed(")] + r'''
 int main(int argc, char **argv) {
     assert(argc == 5);
@@ -69,7 +76,10 @@ int main(int argc, char **argv) {
         work = Path(tmp)
         source, exe = work / "fixture.cpp", work / "fixture.exe"
         source.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++17", str(source), "-o", str(exe)], check=True)
+        cxx_flags = ["-std=c++17"]
+        if (posix / "windows.h").is_file():
+            cxx_flags += ["-I" + str(posix), "-D_GNU_SOURCE"]
+        subprocess.run([args.cxx, *cxx_flags, str(source), "-o", str(exe)], check=True)
         for saved, handheld, override, mode, w, h, label in cases:
             (work / "hookshot_options.ini").write_text(f"output_res={saved}\nhandheld_profile={handheld}\n", encoding="ascii")
             env = os.environ.copy()

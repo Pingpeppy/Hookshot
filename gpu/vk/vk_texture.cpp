@@ -1814,7 +1814,6 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
-    born_ring[frame_no % 300] += x.bytes + x.pad;
     InitRedirect redirect;   // (a parallel replay's worker: into the earliest open segment's init command buffer)
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
@@ -1856,6 +1855,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     p->id = ++ids;
     p->first_seen = frame_no;
     st_made++;
+    born_ring[frame_no % 300] += x.bytes + x.pad;
     p->key_layout = key.layout, p->key_cls = key.cls;
     {   // (another image at this storage: what tells them apart; content one renders the other does not see)
         static int told;

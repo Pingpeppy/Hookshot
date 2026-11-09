@@ -1067,9 +1067,6 @@ std::atomic<int> prep_stage{0};   // 0 the programs, 1 the pipelines the notes p
 std::atomic<size_t> prep_done{0}, prep_total{0};
 std::atomic<bool> prep_running{false}, prep_finished{false};
 HANDLE prep_ended = nullptr;
-#ifndef _WIN32
-const MkwVkWindow* prep_window = nullptr;   // (its size)
-#endif
 void prep_progress(size_t done, size_t total) {
     prep_done.store(done, std::memory_order_relaxed);
     prep_total.store(total, std::memory_order_relaxed);
