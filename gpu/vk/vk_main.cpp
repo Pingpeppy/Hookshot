@@ -4,6 +4,8 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -531,6 +533,363 @@ HWND main_window = nullptr;
 #ifndef _WIN32
 const MkwVkWindow* prep_window = nullptr;
 #endif
+// 5x7, bit 4 is the leftmost pixel. Lower case is drawn as upper case.
+const uint8_t* splash_glyph(char c) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+    static const uint8_t font[59][7] = {
+        {}, {}, {}, {}, {},
+        {0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13}, // %
+        {}, {},
+        {0x04, 0x08, 0x10, 0x10, 0x10, 0x08, 0x04}, // (
+        {0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10}, // )
+        {}, {}, {}, {}, {},
+        {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}, // /
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // 0
+        {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+        {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+        {0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E},
+        {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
+        {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+        {0x0E, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x0E},
+        {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+        {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+        {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}, // 9
+        {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}, // :
+        {}, {}, {}, {}, {}, {},
+        {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, // A
+        {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+        {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+        {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+        {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+        {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+        {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E},
+        {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+        {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
+        {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C},
+        {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
+        {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+        {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+        {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+        {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+        {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
+        {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+        {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
+        {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+        {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+        {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
+        {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
+        {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
+        {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
+        {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}, // Z
+    };
+    if ((unsigned)c < 32 || (unsigned)c > 90) return font[0];
+    return font[c - 32];
+}
+
+struct Splash {
+    bool ready = false;
+    bool failed = false;
+    bool busy = false;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint8_t* map = nullptr;
+    uint32_t width = 0;
+    int last_pct = -2;
+    std::chrono::steady_clock::time_point last_draw{};
+    std::chrono::steady_clock::time_point phase_t0{};
+    size_t phase_total = 0;
+};
+Splash splash;
+
+void splash_free_buffer() {
+    if (splash.mem) {
+        auto unmap = (PFN_vkUnmapMemory)vkGetDeviceProcAddr(dev.device, "vkUnmapMemory");
+        if (unmap && splash.map) unmap(dev.device, splash.mem);
+        vkFreeMemory(dev.device, splash.mem, nullptr);
+    }
+    if (splash.buf) vkDestroyBuffer(dev.device, splash.buf, nullptr);
+    splash.buf = VK_NULL_HANDLE;
+    splash.mem = VK_NULL_HANDLE;
+    splash.map = nullptr;
+    splash.width = 0;
+}
+
+void splash_stop() {
+    if (splash.busy && splash.fence)
+        vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 500000000ull);
+    splash.busy = false;
+    splash_free_buffer();
+    if (splash.acquired) vkDestroySemaphore(dev.device, splash.acquired, nullptr);
+    if (splash.fence) vkDestroyFence(dev.device, splash.fence, nullptr);
+    if (splash.pool) vkDestroyCommandPool(dev.device, splash.pool, nullptr);
+    splash.acquired = VK_NULL_HANDLE;
+    splash.fence = VK_NULL_HANDLE;
+    splash.pool = VK_NULL_HANDLE;
+    splash.cmd = VK_NULL_HANDLE;
+    splash.ready = false;
+}
+
+bool splash_init() {
+    if (splash.ready || splash.failed) return splash.ready;
+    if (dev.offscreen || !dev.swapchain || dev.swap_images.empty()) return false;
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = dev.queue_family;
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateCommandPool(dev.device, &pi, nullptr, &splash.pool) != VK_SUCCESS) {
+        splash.failed = true;
+        return false;
+    }
+    ai.commandPool = splash.pool;
+    if (vkAllocateCommandBuffers(dev.device, &ai, &splash.cmd) != VK_SUCCESS ||
+        vkCreateFence(dev.device, &fi, nullptr, &splash.fence) != VK_SUCCESS ||
+        vkCreateSemaphore(dev.device, &si, nullptr, &splash.acquired) != VK_SUCCESS) {
+        splash_stop();
+        splash.failed = true;
+        return false;
+    }
+    splash.ready = true;
+    logf("vk: shader prep draws its progress on the window");
+    return true;
+}
+
+bool splash_buffer(uint32_t width) {
+    constexpr uint32_t kBand = 56;
+    if (splash.map && splash.width == width) return true;
+    splash_free_buffer();
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < dev.memory.memoryTypeCount; i++) {
+        const VkMemoryPropertyFlags f = dev.memory.memoryTypes[i].propertyFlags;
+        if ((f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == UINT32_MAX) return false;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = (VkDeviceSize)width * kBand * 4;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &splash.buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(dev.device, splash.buf, &req);
+    VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ma.allocationSize = req.size;
+    ma.memoryTypeIndex = type;
+    if ((req.memoryTypeBits & (1u << type)) == 0 ||
+        vkAllocateMemory(dev.device, &ma, nullptr, &splash.mem) != VK_SUCCESS ||
+        vkBindBufferMemory(dev.device, splash.buf, splash.mem, 0) != VK_SUCCESS ||
+        vkMapMemory(dev.device, splash.mem, 0, req.size, 0, (void**)&splash.map) != VK_SUCCESS) {
+        splash_free_buffer();
+        return false;
+    }
+    splash.width = width;
+    return true;
+}
+
+void splash_text(uint8_t* px, uint32_t width, uint32_t height, int scale, const char* text, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (!text || !*text || scale < 1) return;
+    const int gw = 6 * scale;
+    const int n = (int)strlen(text);
+    int x = ((int)width - n * gw) / 2;
+    const bool bgra = dev.swap_format == VK_FORMAT_B8G8R8A8_UNORM;
+    for (int i = 0; i < n; i++, x += gw) {
+        const uint8_t* rows = splash_glyph(text[i]);
+        for (int row = 0; row < 7; row++)
+            for (int col = 0; col < 5; col++) {
+                if ((rows[row] & (0x10 >> col)) == 0) continue;
+                for (int dy = 0; dy < scale; dy++)
+                    for (int dx = 0; dx < scale; dx++) {
+                        const int px_x = x + col * scale + dx, px_y = y + row * scale + dy;
+                        if (px_x < 0 || px_y < 0 || px_x >= (int)width || px_y >= (int)height) continue;
+                        uint8_t* p = px + ((size_t)px_y * width + px_x) * 4;
+                        if (bgra) p[0] = b, p[1] = g, p[2] = r;
+                        else p[0] = r, p[1] = g, p[2] = b;
+                        p[3] = 255;
+                    }
+            }
+    }
+}
+
+void splash_title(const char* text) {
+    char title[160];
+    snprintf(title, sizeof title, "Hookshot — %s", text);
+#ifdef _WIN32
+    if (main_window) SetWindowTextA(main_window, title);
+#else
+    if (prep_window && prep_window->version >= 2 && prep_window->set_title)
+        prep_window->set_title(prep_window->window, title);
+#endif
+}
+
+// A clear plus one small copy. No pipeline is built, so this does not join the shader compiles.
+void splash_progress(size_t done, size_t total) {
+    if (dev.offscreen || !dev.swapchain) return;
+#ifdef _WIN32
+    MSG msg;
+    while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_PAINT && msg.hwnd) {
+            ValidateRect(msg.hwnd, nullptr);
+            continue;
+        }
+        if (msg.message == WM_ERASEBKGND) continue;
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+#endif
+    char line[120];
+    char eta[48] = "";
+    const auto now = std::chrono::steady_clock::now();
+    if (!total) {
+        snprintf(line, sizeof line, "Preparing shaders");
+    } else {
+        if (splash.phase_total != total || done < 1) {
+            if (splash.phase_total != total) splash.phase_t0 = now, splash.phase_total = total;
+        }
+        const size_t pct = done * 100 / total;
+        snprintf(line, sizeof line, "Preparing shaders: %zu / %zu (%zu%%)", done, total, pct);
+        if (done > 0 && done < total) {
+            const double elapsed = std::chrono::duration<double>(now - splash.phase_t0).count();
+            const double left = elapsed * (double)(total - done) / (double)done;
+            if (elapsed >= 1.0 && left >= 1.0) {
+                if (left >= 90.0) snprintf(eta, sizeof eta, "about %u min left", (unsigned)(left / 60.0 + 0.5));
+                else snprintf(eta, sizeof eta, "about %u s left", (unsigned)(left + 0.5));
+            }
+        }
+    }
+    char both[160];
+    snprintf(both, sizeof both, "%s%s%s", line, eta[0] ? " — " : "", eta);
+    splash_title(both);
+    if (!splash_init()) return;
+    const int pct = total ? (int)(done * 100 / total) : -1;
+    if (splash.last_draw.time_since_epoch().count() != 0 && now - splash.last_draw < std::chrono::milliseconds(250) &&
+        pct == splash.last_pct)
+        return;
+    if (splash.busy && vkWaitForFences(dev.device, 1, &splash.fence, VK_TRUE, 0) != VK_SUCCESS) return;
+    const uint32_t width = dev.swap_extent.width, height = dev.swap_extent.height;
+    constexpr uint32_t kBand = 56;
+    if (!width || !height || !splash_buffer(width)) return;
+    const uint32_t band = std::min(kBand, height);
+    const bool bgra = dev.swap_format == VK_FORMAT_B8G8R8A8_UNORM;
+    uint8_t bg[4] = {18, 20, 26, 255};
+    if (bgra) bg[0] = 26, bg[1] = 20, bg[2] = 18;
+    for (uint32_t i = 0; i < width * band; i++) memcpy(splash.map + (size_t)i * 4, bg, 4);
+    const int scale = width >= 900 ? 2 : 1;
+    splash_text(splash.map, width, band, scale, line, 4, 235, 236, 240);
+    if (eta[0]) splash_text(splash.map, width, band, scale, eta, 4 + 8 * scale, 190, 196, 210);
+    const int bar_y = 4 + 16 * scale + 4;
+    const int bar_h = std::max(6, 4 * scale);
+    const int bar_x = (int)width / 10;
+    const int bar_w = (int)width - 2 * bar_x;
+    auto fill_rect = [&](int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t c[4] = {r, g, b, 255};
+        if (bgra) c[0] = b, c[1] = g, c[2] = r;
+        for (int row = y; row < y + h && row < (int)band; row++) {
+            if (row < 0) continue;
+            for (int col = x; col < x + w && col < (int)width; col++) {
+                if (col < 0) continue;
+                memcpy(splash.map + ((size_t)row * width + col) * 4, c, 4);
+            }
+        }
+    };
+    if (bar_y + bar_h <= (int)band && bar_w > 0) {
+        fill_rect(bar_x, bar_y, bar_w, bar_h, 48, 52, 62);
+        if (total) {
+            int fw = (int)((uint64_t)bar_w * std::min(done, total) / total);
+            if (done && !fw) fw = 1;
+            fill_rect(bar_x, bar_y, fw, bar_h, 232, 146, 42);
+        }
+    }
+    if (splash.busy) vkResetFences(dev.device, 1, &splash.fence), splash.busy = false;
+    const uint64_t acquire_ns = splash.last_draw.time_since_epoch().count() == 0 ? 100000000ull : 0ull;
+    uint32_t index = 0;
+    const VkResult got = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_ns, splash.acquired, VK_NULL_HANDLE, &index);
+    if (got == VK_TIMEOUT || got == VK_NOT_READY || got == VK_ERROR_OUT_OF_DATE_KHR) return;
+    if ((got != VK_SUCCESS && got != VK_SUBOPTIMAL_KHR) || index >= dev.swap_images.size() || index >= dev.swap_rendered.size() ||
+        !dev.swap_rendered[index])
+        return;
+    vkResetCommandPool(dev.device, splash.pool, 0);
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(splash.cmd, &cbbi) != VK_SUCCESS) {
+        splash.failed = true;
+        return;
+    }
+    auto barrier = [&](VkImageLayout from, VkImageLayout to) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = dev.swap_images[index];
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(splash.cmd, &di);
+    };
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearColorValue dark{18 / 255.0f, 20 / 255.0f, 26 / 255.0f, 1.0f};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(splash.cmd, dev.swap_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dark, 1, &range);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.bufferRowLength = width;
+    copy.bufferImageHeight = band;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageOffset = {0, (int32_t)((height - band) / 2), 0};
+    copy.imageExtent = {width, band, 1};
+    vkCmdCopyBufferToImage(splash.cmd, splash.buf, dev.swap_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (vkEndCommandBuffer(splash.cmd) != VK_SUCCESS) {
+        splash.failed = true;
+        return;
+    }
+    VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    wait.semaphore = splash.acquired;
+    wait.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    signal.semaphore = dev.swap_rendered[index];
+    signal.stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkCommandBufferSubmitInfo cbs{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbs.commandBuffer = splash.cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.waitSemaphoreInfoCount = 1;
+    submit.pWaitSemaphoreInfos = &wait;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cbs;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signal;
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &dev.swap_rendered[index];
+    present.swapchainCount = 1;
+    present.pSwapchains = &dev.swapchain;
+    present.pImageIndices = &index;
+    {
+        std::lock_guard qk(dev.present_mu);
+        queue_flush_locked();
+        if (vkQueueSubmit2(dev.queue, 1, &submit, splash.fence) != VK_SUCCESS) {
+            splash.failed = true;
+            return;
+        }
+        vkQueuePresentKHR(dev.queue, &present);
+    }
+    splash.busy = true;
+    splash.last_draw = now;
+    splash.last_pct = pct;
+}
+
 void prep_title(size_t done, size_t total, const char* what) {
 #ifndef _WIN32
     if (!prep_window || prep_window->version < 2 || !prep_window->set_title || !total) return;
@@ -587,7 +946,7 @@ bool started_up() {
         return true;
     }
     if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
-        // (a console while it lasts: there is no window yet, and a long wait with nothing on screen looks like a hang)
+        // (the window is already open, but nothing has been presented, so it stays blank until the progress bar below)
         static HANDLE console = nullptr;
         const auto progress = [](size_t done, size_t total) {
             static bool tried = false;
@@ -611,18 +970,22 @@ bool started_up() {
                     if (console == INVALID_HANDLE_VALUE) console = nullptr;
                 }
             }
-            prep_title(done, total, "preparing shaders before the game");
+            splash_progress(done, total);
             if (!console) return;
             char line[80];
             const int n = snprintf(line, sizeof line, "%cPreparing shaders: %zu of %zu (%zu%%)   ", 13, done, total, done * 100 / total);
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
+        splash_progress(0, 0);
         if (prepare_run(progress)) predict_run(progress);
         precompile_run(progress);
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
+        splash_stop();
         prep_title(1, 1, "Hookshot");
-#ifndef _WIN32
+#ifdef _WIN32
+        if (main_window) SetWindowTextA(main_window, "Hookshot");
+#else
         if (prep_window && prep_window->version >= 2 && prep_window->set_title)
             prep_window->set_title(prep_window->window, "Hookshot");
 #endif

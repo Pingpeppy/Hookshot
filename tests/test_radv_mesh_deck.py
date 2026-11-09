@@ -48,6 +48,8 @@ def main():
         raise SystemExit("vk_main.cpp: RADV pipeline creates must be serialized unless RX_VK_PIPELINE_SERIAL=0")
     if "one driver thread" not in VKMAIN or "install_radv_driver_thread" not in VKMAIN:
         raise SystemExit("vk_main.cpp: RADV shader and pipeline calls must run on one driver thread")
+    if "Preparing shaders:" not in VKMAIN or "splash_progress" not in VKMAIN:
+        raise SystemExit("vk_main.cpp: shader prep must draw Preparing shaders: N / total on the window")
     if "predicting pipelines from" not in DRAW or "startup_driver_threads" not in DRAW:
         raise SystemExit("vk_draw.cpp: prediction must log and honor RX_VK_PRECOMPILE_THREADS")
     build = (ROOT / "nx2/build.py").read_text(encoding="utf-8")
