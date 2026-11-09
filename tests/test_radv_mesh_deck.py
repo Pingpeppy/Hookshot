@@ -32,6 +32,13 @@ def main():
         raise SystemExit("hos_main.c: Deck profile is missing")
     if "RX_VK_DECK=0" not in MAIN:
         raise SystemExit("hos_main.c: RX_VK_DECK=0 must turn the profile off")
+    if "RX_DECK_PICTURE" not in MAIN or "deck picture %ux%u" not in MAIN:
+        raise SystemExit("hos_main.c: the Deck picture must default to 1280x720 with RX_DECK_PICTURE")
+    if "RX_DECK_PICTURE=0 keeps 2560x1440" not in MAIN:
+        raise SystemExit("hos_main.c: RX_DECK_PICTURE=0 must keep the shipped picture")
+    MENU = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    if "old_picture ? 4 : 1" not in MENU:
+        raise SystemExit("vk_menu.cpp: a 720p Deck picture defaults to 100%, and RX_DECK_PICTURE=0 keeps 50%")
     if "if (!view && !dev.null_descriptor) view = dummies.view[(int)vt]" not in DRAW:
         raise SystemExit("vk_draw.cpp: a missing view is null when nullDescriptor is on, else the dummy")
     if "image view missing and the dummy view was not made" not in DRAW or "told++ < 32" not in DRAW:

@@ -4,7 +4,8 @@ The game draws a 2560x1440 picture whatever the screen and renders its scene at 
 With these patches the picture takes the window's shape (the height stays the game's, the width grows: Hor+), the 16:9
 cameras take the picture's ratio, the HUD and menus keep their 16:9 shape in the middle of the picture, and pre-rendered
 movies play in that middle 16:9. Every patch reads host globals (host/hos_wide.c) that stay 0 for a 16:9 window, so the
-game runs as shipped then.
+game runs as shipped then. The Deck profile writes 1280x720 and 960x540 into those globals (RX_DECK_PICTURE in
+host/hos_main.c); 0 there is still the shipped 2560x1440 picture and 1920x1080 scene.
 
 The sites and what each does come from NX2navi's recomp/patches-v111.txt, where they are credited to Ivan0xFF (MIT,
 "The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF"); the picture and scene size sites are the same

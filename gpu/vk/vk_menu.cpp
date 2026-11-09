@@ -801,8 +801,15 @@ void menu_init() {
     if (opts.preset > 0) sync_preset_budgets(opts.preset);
     // Steam Deck OLED is a 15 W APU at 1280x800. Auto resolution stays at the game's docked size, and frame
     // generation spends the same GPU on made frames. hos_main.c sets RX_VK_DECK. RX_VK_KEEP_RES=1 leaves Auto alone.
-    if (const char* deck = getenv("RX_VK_DECK"); deck && deck[0] != '0' && !getenv("RX_VK_KEEP_RES") && opts.resolution == 0)
-        opts.resolution = 4;
+    // The Deck picture is 1280x720, so the scene is already 960x540. 100% of that is the old 50% of 1920x1080.
+    // A saved 50% still halves the new scene. RX_DECK_PICTURE=0 keeps the 2560x1440 picture and the 50% default.
+    if (const char* deck = getenv("RX_VK_DECK"); deck && deck[0] != '0' && !getenv("RX_VK_KEEP_RES") && opts.resolution == 0) {
+        const char* pic = getenv("RX_DECK_PICTURE");
+        const bool old_picture = pic && pic[0] == '0' && pic[1] == '\0';
+        opts.resolution = old_picture ? 4 : 1;
+        logf("vk: deck resolution %s (picture %s; 100%% of 960x540 matches 50%% of the old 1920x1080 scene)",
+             old_picture ? "50%" : "100%", old_picture ? "2560x1440" : "1280x720");
+    }
     if (opts.framegen == 1) opts.framegen = 2;
     if (const char* e = getenv("RX_VK_FRAMEGEN")) {
         const int v = atoi(e);

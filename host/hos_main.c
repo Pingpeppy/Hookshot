@@ -542,10 +542,31 @@ static int game_main(int argc, char **argv) {
         extern volatile uint64_t hos_wide_out, hos_wide_scene;
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
         const double game = 16.0 / 9.0;
+        /* Deck profile: the picture is 1280x720 and the scene is 3/4 of it (960x540), the same ratio as the shipped
+           2560x1440 picture and 1920x1080 scene. A 16:9 picture leaves the camera, HUD and movie patches off (they run
+           only when the picture is wider than 16:9), so the 3840x2160 UI grid still fills the picture. RX_DECK_PICTURE=
+           <w>x<h> picks another picture; RX_DECK_PICTURE=0 keeps 2560x1440. Desktop is unchanged unless that variable
+           is set. Ultrawide on the Deck uses this height instead of 1440. */
+        const char *pic = getenv("RX_DECK_PICTURE");
+        const char *deck = getenv("RX_VK_DECK");
+        const int deck_on = deck && deck[0] != '0';
+        const int old_size = pic && pic[0] == '0' && pic[1] == '\0';
+        unsigned deck_w = 1280, deck_h = 720;
+        int deck_picture = 0;
+        if (!old_size && pic && sscanf(pic, "%ux%u", &deck_w, &deck_h) == 2 && deck_w >= 64 && deck_h >= 64)
+            deck_picture = 1;
+        else if (!old_size && !pic && deck_on)
+            deck_picture = 1;
+        if (deck_picture) {
+            deck_w = (deck_w + 4u) / 8u * 8u;
+            deck_h = (deck_h + 4u) / 8u * 8u;
+        }
         if (want > game * 1.01) {
             double r = want > 32.0 / 9.0 ? 32.0 / 9.0 : want;
-            const unsigned oh = 1440, ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
-            const unsigned sh = 1080, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
+            const unsigned oh = deck_picture ? deck_h : 1440;
+            const unsigned ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
+            const unsigned sh = deck_picture ? oh * 3u / 4u : 1080;
+            const unsigned sw = deck_picture ? ow * 3u / 4u : (unsigned)(ow * 0.75 / 8 + 0.5) * 8;
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;
             hos_wide_ratio = (float)ow / (float)oh;
@@ -554,6 +575,12 @@ static int game_main(int argc, char **argv) {
             hos_aspect_ratio = hos_wide_ratio;
             hos_log("boot: widescreen: picture %ux%u, scene %ux%u, camera ratio %.4f, HUD and movies in the middle %.1f%%", ow, oh, sw, sh,
                     (double)hos_wide_ratio, hos_wide_squeeze * 100.0);
+        } else if (deck_picture) {
+            const unsigned ow = deck_w, oh = deck_h, sw = ow * 3u / 4u, sh = oh * 3u / 4u;
+            hos_wide_out = (uint64_t)oh << 32 | ow;
+            hos_wide_scene = (uint64_t)sh << 32 | sw;
+            hos_log("boot: deck picture %ux%u, scene %ux%u (3/4 of the picture). RX_DECK_PICTURE=0 keeps 2560x1440 and 1920x1080",
+                    ow, oh, sw, sh);
         } else if (want > 1.0f) {
             hos_log("boot: widescreen: a %.4f screen is not wider than 16:9: the game's own picture", (double)want);
         }
@@ -699,8 +726,10 @@ static void deck_profile(void) {
         }
     }
     fprintf(stderr, "hookshot: Steam Deck profile on (occlusion queries off, frame generation off, 45 fps cap, "
-                    "game told the Switch 2 heap of 9809 MB, low-memory texture and staging limits). "
-                    "RX_VK_DECK=0 turns the profile off. RX_VK_LOW_MEM=0 turns the memory limits off. "
+                    "game told the Switch 2 heap of 9809 MB, low-memory texture and staging limits, "
+                    "internal picture 1280x720). "
+                    "RX_VK_DECK=0 turns the profile off. RX_DECK_PICTURE=0 keeps the 2560x1440 picture. "
+                    "RX_VK_LOW_MEM=0 turns the memory limits off. "
                     "RX_VK_LOW_HEAP=1 tells the game 4608 MB, which leaves a pointer null at the first submit. "
                     "HOS_MEMORY_MB overrides the heap.\n");
 }
