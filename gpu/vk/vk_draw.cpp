@@ -734,6 +734,8 @@ bool depth_aspect(VkFormat f) {
 
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
 #ifdef _WIN32
+VkResult guarded_graphics_call(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl);
+VkResult guarded_compute_call(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl);
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     PipelineCreateLock lock;   // (outside the __try: an SEH frame cannot own a C++ object)
     return guarded_graphics_call(cache, ci, pl);

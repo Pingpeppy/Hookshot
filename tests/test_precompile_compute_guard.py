@@ -73,11 +73,12 @@ def main():
     if os.name != "nt":
         raise SystemExit("Windows structured exceptions required")
     source=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
-    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute(')
+    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute_call(')
     precompile=block(source,'void precompile_run(')
     arm=block(precompile,'if (i < computes.size()) {')
     # ci/made identities are checked at the boundary as well as inside the API spy.
     armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
+    armed=armed.replace('guarded_compute(', 'guarded_compute_call(')
     assert armed != arm
     cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){std::vector<Program*>computes{&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
 int main(int argc,char**argv){
@@ -86,7 +87,7 @@ int main(int argc,char**argv){
  if(which==4){
   mode=1;VkComputePipelineCreateInfo ci{10};ci.stage={11,12,0x2468,"main"};ci.layout=0x1357;VkPipeline out=0;
   expected_ci=&ci;expected_out=&out;
-  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
+  CHECK(guarded_compute_call(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
  }
  mode=which==1?1:which==2?2:0;pre.abandoned=which==3;
  std::thread worker([&]{actual_arm(program,&pre);});worker.join();

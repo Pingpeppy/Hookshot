@@ -40,6 +40,7 @@ uint32_t driver_bank_word(const NvnState&, int, int, uint32_t offset) { return h
 uint32_t stage_handle(const NvnState&, const Stage&, uint32_t) { std::abort(); }
 uint8_t texture_answer(uint32_t h) { return h ? answers[h] : 0xff; }
 uint32_t texture_slot_version(int id) { return 10+id; }
+thread_local const std::vector<Program::Answer>* answers_in = nullptr;
 #include MATCHER_FUNCTIONS
 static unsigned failed=0,checked=0;
 static void check(bool b,const char* what){checked++;if(!b){failed++;fprintf(stderr,"FAIL: %s\n",what);}}
